@@ -44,7 +44,10 @@ if tab == "대회 문서 Q&A":
                             tmp.write(raw)
                             tmp_path = tmp.name
                         loader = PyPDFLoader(tmp_path)
-                        docs.extend(loader.load())
+                        loaded = loader.load()
+                        for doc in loaded:
+                            doc.metadata["source"] = uf.name
+                        docs.extend(loaded)
                         os.unlink(tmp_path)
                     else:
                         text = raw.decode("utf-8", errors="ignore")
