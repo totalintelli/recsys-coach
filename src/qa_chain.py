@@ -44,12 +44,27 @@ def answer_question(vectorstore: FAISS, question: str) -> dict[str, Any]:
     llm = ChatUpstage(api_key=UPSTAGE_API_KEY, model="solar-pro")
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "다음 문서를 참고하여 질문에 답하세요.\n\n{context}"),
+        ("system", (
+            "다음 문서를 참고하여 질문에 답하세요.\n"
+            "각 문장 끝에 해당 내용의 출처를 공백 한 칸을 두고 [document.pdf 3 page] 같은 형식으로 반드시 붙이세요. "
+            "출처를 알 수 없는 문장에는 태그를 붙이지 마세요.\n\n{context}"
+        )),
         ("human", "{question}"),
     ])
 
     def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
+        parts = []
+        for doc in docs:
+            src = doc.metadata.get("source", "")
+            page = doc.metadata.get("page")
+            if src and page is not None:
+                tag = f"[{src} {page + 1} page]"
+            elif src:
+                tag = f"[{src}]"
+            else:
+                tag = ""
+            parts.append(f"{tag}\n{doc.page_content}" if tag else doc.page_content)
+        return "\n\n".join(parts)
 
     chain = (
         {"context": retriever | format_docs, "question": RunnablePassthrough()}

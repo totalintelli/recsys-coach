@@ -100,7 +100,9 @@ if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
 
             if result["sources"]:
                 with st.expander("참고 문서"):
-                    for i, doc in enumerate(result["sources"], 1):
+                    seen_src = set()
+                    for doc in result["sources"]:
                         src = doc.metadata.get("source", "unknown")
-                        st.markdown(f"**[{i}] {src}**")
-                        st.text(doc.page_content[:400] + ("..." if len(doc.page_content) > 400 else ""))
+                        if src not in seen_src:
+                            seen_src.add(src)
+                            st.markdown(f"- {src}")
