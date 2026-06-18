@@ -96,6 +96,23 @@ if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
                 result = answer_question(st.session_state["vectorstore"], question)
 
             st.markdown(result["answer"])
+
+            if result["sources"]:
+                seen = set()
+                tags = []
+                for doc in result["sources"]:
+                    src = doc.metadata.get("source", "")
+                    page = doc.metadata.get("page")
+                    key = (src, page)
+                    if key not in seen:
+                        seen.add(key)
+                        if src and page is not None:
+                            tags.append(f"[{src}, {page + 1} page]")
+                        elif src:
+                            tags.append(f"[{src}]")
+                if tags:
+                    st.caption(" · ".join(tags))
+
             st.session_state["chat_history"].append({"role": "assistant", "content": result["answer"]})
 
             if result["sources"]:
