@@ -1,0 +1,13 @@
+streamlit>=1.35
+langchain>=0.2
+langchain-community>=0.2
+langchain-text-splitters>=0.2
+langchain-upstage>=0.1
+faiss-cpu>=1.8
+pypdf>=4.0
+python-dotenv>=1.0
+ydata-profiling>=4.6
+streamlit-pandas-profiling>=0.1
+pandas>=2.0
+torch>=2.0
+plotly>=5.0
