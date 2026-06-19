@@ -28,7 +28,8 @@ _UPSTAGE_SYSTEM_PROMPT = """\
 규칙:
 - 문서에 명시된 내용을 우선하고, 문서에 없는 내용은 "문서에서 확인할 수 없습니다"라고 답변하세요.
 - 코드나 수식이 포함된 경우 마크다운 코드 블록(```python)을 사용하세요.
-- 목록이나 단계가 있는 경우 번호 목록 또는 불릿 목록으로 정리하세요.
+- 답변의 핵심 주제가 있으면 ## 헤더로 제목을 붙이세요.
+- 목록이나 단계가 있는 경우 번호 목록 또는 불릿 목록으로 정리하고, 하위 항목은 들여쓰기 불릿(  - )으로 계층을 표현하세요.
 - 답변은 한국어로, 명확하고 간결하게 작성하세요.
 
 참고 문서:
@@ -42,6 +43,8 @@ _LLAMA3_TEMPLATE = (
     "규칙:\n"
     "- 문서에 명시된 내용을 우선하고, 문서에 없는 내용은 '문서에서 확인할 수 없습니다'라고 답변하세요.\n"
     "- 코드나 수식이 포함된 경우 마크다운 코드 블록을 사용하세요.\n"
+    "- 답변의 핵심 주제가 있으면 ## 헤더로 제목을 붙이세요.\n"
+    "- 목록이나 단계가 있는 경우 불릿 목록으로 정리하고, 하위 항목은 들여쓰기 불릿(  - )으로 계층을 표현하세요.\n"
     "- 답변은 한국어로 작성하세요.\n\n"
     "참고 문서:\n{context}"
     "<|eot_id|>"
@@ -71,6 +74,54 @@ def _clean_answer(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r" {2,}", " ", text)
     return text.strip()
+
+
+def _md_to_html(text: str) -> str:
+    """마크다운 계층 불릿·헤더를 HTML로 변환해 Streamlit 렌더링을 보정한다."""
+    lines = text.split("\n")
+    out: list[str] = []
+    list_depth = 0
+
+    def close_lists(target_depth: int) -> None:
+        nonlocal list_depth
+        while list_depth > target_depth:
+            out.append("</ul>")
+            list_depth -= 1
+
+    for line in lines:
+        h2 = re.match(r"^##\s+(.*)", line)
+        if h2:
+            close_lists(0)
+            out.append(f"<h3 style='color:#5B5EA6;margin-top:0.8em'>{h2.group(1)}</h3>")
+            continue
+
+        bullet = re.match(r"^(\s*)[-*]\s+(.*)", line)
+        if bullet:
+            indent = len(bullet.group(1))
+            depth = (indent // 2) + 1
+            while list_depth < depth:
+                out.append("<ul>")
+                list_depth += 1
+            close_lists(depth)
+            out.append(f"<li>{bullet.group(2)}</li>")
+            continue
+
+        num = re.match(r"^(\s*)\d+\.\s+(.*)", line)
+        if num:
+            close_lists(0)
+            out.append(f"<li>{num.group(2)}</li>")
+            continue
+
+        if line.strip() == "":
+            close_lists(0)
+            out.append("<br>")
+            continue
+
+        close_lists(0)
+        out.append(line)
+
+    close_lists(0)
+    return "\n".join(out)
 
 
 def _enrich_chunk(doc: Document) -> Document:

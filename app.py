@@ -61,7 +61,11 @@ if tab == "대회 문서 Q&A":
     if "vectorstore" in st.session_state:
         for msg in st.session_state.get("chat_history", []):
             with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+                if msg["role"] == "assistant":
+                    from src.qa_chain import _md_to_html
+                    st.markdown(_md_to_html(msg["content"]), unsafe_allow_html=True)
+                else:
+                    st.markdown(msg["content"])
     else:
         st.info("위 업로더에서 대회 문서(PDF 또는 TXT)를 업로드하면 Q&A를 시작할 수 있습니다.")
 
@@ -95,8 +99,6 @@ if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
                 from src.qa_chain import answer_question
                 result = answer_question(st.session_state["vectorstore"], question)
 
-            st.markdown(result["answer"])
-
             if result["sources"]:
                 seen = set()
                 tags = []
@@ -112,6 +114,10 @@ if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
                             tags.append(f"[{src}]")
                 if tags:
                     st.caption(" · ".join(tags))
+                    st.markdown("")
+
+            from src.qa_chain import _md_to_html
+            st.markdown(_md_to_html(result["answer"]), unsafe_allow_html=True)
 
             st.session_state["chat_history"].append({"role": "assistant", "content": result["answer"]})
 
