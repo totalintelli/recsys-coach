@@ -17,6 +17,7 @@ LLAMA_MODEL_ID     = os.getenv("LLAMA_MODEL_ID", "meta-llama/Meta-Llama-3-8B-Ins
 LLAMA_LOAD_IN_8BIT = os.getenv("LLAMA_LOAD_IN_8BIT", "true").lower() == "true"
 
 _llama_llm_cache: Any | None = None
+_answer_cache: dict[tuple[int, str], dict] = {}
 
 # ── 프롬프트 ──────────────────────────────────────────────────────────────────
 
@@ -54,12 +55,19 @@ _LLAMA3_TEMPLATE = (
 
 def _clean_text(text: str) -> str:
     """문서 청크의 노이즈 문자를 정규화한다."""
-    # 이스케이프된 개행 복원
     text = text.replace("\\n", "\n").replace("\\t", "\t")
-    # HTML 태그 제거 (<br>, <br/>, <p>, 등)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
-    # 연속 공백/개행 정리 (3개 이상 → 2개)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
+def _clean_answer(text: str) -> str:
+    """LLM 출력의 잔여 노이즈를 제거한다."""
+    text = text.replace("\\n", "\n").replace("\\t", "\t")
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r" {2,}", " ", text)
     return text.strip()
@@ -72,6 +80,37 @@ def _enrich_chunk(doc: Document) -> Document:
     header = f"[출처: {source}" + (f", {page + 1}페이지" if page is not None else "") + "]\n"
     cleaned = _clean_text(doc.page_content)
     return Document(page_content=header + cleaned, metadata=doc.metadata)
+
+
+# ── 청킹 ─────────────────────────────────────────────────────────────────────
+
+def _split_documents(docs: list[Document]) -> list[Document]:
+    """문단/문장 경계 기반으로 문서를 청크로 분리한다."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=600,
+        chunk_overlap=80,
+        separators=["\n\n", "\n", "。", ".", "！", "？", " ", ""],
+        keep_separator=False,
+    )
+    return splitter.split_documents(docs)
+
+
+# ── Reranker ──────────────────────────────────────────────────────────────────
+
+def _rerank_with_cross_encoder(query: str, docs: list[Document], top_k: int = 3) -> list[Document]:
+    """Cross-Encoder로 문서를 재순위한다. sentence-transformers 미설치 시 단순 슬라이스 fallback."""
+    try:
+        from sentence_transformers import CrossEncoder
+        model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        scores = model.predict([(query, doc.page_content) for doc in docs])
+        ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        return [doc for _, doc in ranked[:top_k]]
+    except ImportError:
+        return docs[:top_k]
+    except Exception:
+        import warnings
+        warnings.warn("[recsys-coach] Reranker 실패, 단순 슬라이스로 폴백합니다.")
+        return docs[:top_k]
 
 
 # ── LLM / 프롬프트 헬퍼 ──────────────────────────────────────────────────────
@@ -143,11 +182,11 @@ def _get_llama_prompt():
 
 def _build_retriever(vectorstore: FAISS, chunks: list[Document]):
     """BM25 + FAISS 앙상블 리트리버를 반환한다. rank-bm25 미설치 시 FAISS만 사용."""
-    faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
     try:
         from langchain_community.retrievers import BM25Retriever
         from langchain.retrievers import EnsembleRetriever
-        bm25 = BM25Retriever.from_documents(chunks, k=5)
+        bm25 = BM25Retriever.from_documents(chunks, k=6)
         return EnsembleRetriever(
             retrievers=[bm25, faiss_retriever],
             weights=[0.4, 0.6],
@@ -159,35 +198,35 @@ def _build_retriever(vectorstore: FAISS, chunks: list[Document]):
 # ── 공개 API ─────────────────────────────────────────────────────────────────
 
 def build_vectorstore(docs: list[Document]) -> FAISS:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=100,
-        separators=["\n\n", "\n", ".", " ", ""],
-    )
-    chunks = splitter.split_documents(docs)
+    chunks = _split_documents(docs)
     enriched = [_enrich_chunk(c) for c in chunks]
-
     vs = FAISS.from_documents(enriched, _get_embeddings())
-    # 하이브리드 검색용으로 청크 목록도 vectorstore 객체에 보관
     vs._chunks = enriched  # type: ignore[attr-defined]
     return vs
 
 
 def answer_question(vectorstore: FAISS, question: str) -> dict[str, Any]:
     """{'answer': str, 'sources': list[Document]} 반환"""
+    # ── 캐시 확인 ────────────────────────────────────────────────────────────
+    cache_key = (id(vectorstore), question)
+    if cache_key in _answer_cache:
+        return _answer_cache[cache_key]
+
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.runnables import RunnablePassthrough
 
     chunks = getattr(vectorstore, "_chunks", None) or []
     retriever = _build_retriever(vectorstore, chunks)
-
     source_docs = retriever.invoke(question)
-    # 상위 3개만 LLM 컨텍스트에 전달 (앙상블은 k=5로 가져왔으므로 재절삭)
-    context_docs = source_docs[:3]
+
+    # Cross-Encoder reranking → 상위 3개
+    context_docs = _rerank_with_cross_encoder(question, source_docs, top_k=3)
 
     if OFFLINE_MODE:
-        answer = "\n\n---\n\n".join(doc.page_content for doc in context_docs)
-        return {"answer": answer, "sources": context_docs}
+        answer = _clean_answer("\n\n---\n\n".join(doc.page_content for doc in context_docs))
+        result = {"answer": answer, "sources": context_docs}
+        _answer_cache[cache_key] = result
+        return result
 
     def format_docs(docs):
         return "\n\n---\n\n".join(doc.page_content for doc in docs)
@@ -202,14 +241,18 @@ def answer_question(vectorstore: FAISS, question: str) -> dict[str, Any]:
         return chain.invoke(question)
 
     if LLM_BACKEND == "llama3":
-        answer = _run_chain(_get_llama_llm(), _get_llama_prompt())
-        return {"answer": answer, "sources": source_docs}
+        raw_answer = _run_chain(_get_llama_llm(), _get_llama_prompt())
+        result = {"answer": _clean_answer(raw_answer), "sources": context_docs}
+        _answer_cache[cache_key] = result
+        return result
 
     try:
-        answer = _run_chain(_get_upstage_llm(), _get_upstage_prompt())
+        raw_answer = _run_chain(_get_upstage_llm(), _get_upstage_prompt())
     except Exception as exc:
         import warnings
         warnings.warn(f"[recsys-coach] Upstage 호출 실패 ({exc!r}), Llama-3으로 폴백합니다.")
-        answer = _run_chain(_get_llama_llm(), _get_llama_prompt())
+        raw_answer = _run_chain(_get_llama_llm(), _get_llama_prompt())
 
-    return {"answer": answer, "sources": source_docs}
+    result = {"answer": _clean_answer(raw_answer), "sources": context_docs}
+    _answer_cache[cache_key] = result
+    return result
