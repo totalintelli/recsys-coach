@@ -18,3 +18,5 @@ bitsandbytes>=0.43
 rank-bm25>=0.2
 sentence-transformers>=2.6
 pytest>=8.0
+markdown-it-py>=3.0
+pygments>=2.0

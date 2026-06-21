@@ -63,8 +63,9 @@ def _clean_text(text: str) -> str:
     text = text.replace("\\n", "\n").replace("\\t", "\t")
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"(?:\[object Object\][,\s]*)+", "", text)  # JS 객체 문자열화 산물 제거
     text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"(?<=\S) {2,}", " ", text)  # 비공백 뒤의 중복 공백만 압축 (줄머리 들여쓰기 보존 → 중첩 목록 유지)
     return text.strip()
 
 
@@ -74,56 +75,172 @@ def _clean_answer(text: str) -> str:
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"(?<=\S) {2,}", " ", text)  # 비공백 뒤의 중복 공백만 압축 (줄머리 들여쓰기 보존 → 중첩 목록 유지)
     return text.strip()
 
 
 def _md_to_html(text: str) -> str:
-    """마크다운 계층 불릿·헤더를 HTML로 변환해 Streamlit 렌더링을 보정한다."""
-    lines = text.split("\n")
-    out: list[str] = []
-    list_depth = 0
+    """마크다운을 Jupyter Notebook 스타일 HTML로 변환한다.
+    markdown-it-py + pygments로 코드 하이라이팅, 표, 목록 등을 완전히 렌더링한다.
+    """
+    if not text or not text.strip():
+        return ""
 
-    def close_lists(target_depth: int) -> None:
-        nonlocal list_depth
-        while list_depth > target_depth:
-            out.append("</ul>")
-            list_depth -= 1
+    try:
+        from markdown_it import MarkdownIt
+        from pygments import highlight
+        from pygments.lexers import get_lexer_by_name, guess_lexer
+        from pygments.formatters import HtmlFormatter
+        from pygments.util import ClassNotFound
+    except ImportError:
+        # 폴백: markdown-it-py나 pygments가 없으면 기본 텍스트를 그대로 반환
+        return text.replace("\n", "<br>")
 
-    for line in lines:
-        h2 = re.match(r"^##\s+(.*)", line)
-        if h2:
-            close_lists(0)
-            out.append(f"<h3 style='color:#5B5EA6;margin-top:0.8em'>{h2.group(1)}</h3>")
-            continue
+    def _highlight_code(code: str, lang: str | None, attrs: str) -> str:
+        if lang:
+            try:
+                lexer = get_lexer_by_name(lang.strip())
+            except ClassNotFound:
+                lexer = guess_lexer(code)
+        else:
+            lexer = guess_lexer(code)
+        formatter = HtmlFormatter(
+            style="default",
+            noclasses=True,
+            wrapcode=True,
+            prestyles="margin:0; padding:0;",
+        )
+        return highlight(code, lexer, formatter)
 
-        bullet = re.match(r"^(\s*)[-*]\s+(.*)", line)
-        if bullet:
-            indent = len(bullet.group(1))
-            depth = (indent // 2) + 1
-            while list_depth < depth:
-                out.append("<ul>")
-                list_depth += 1
-            close_lists(depth)
-            out.append(f"<li>{bullet.group(2)}</li>")
-            continue
+    md = MarkdownIt("commonmark", {"highlight": _highlight_code})
+    md.enable("table")
 
-        num = re.match(r"^(\s*)\d+\.\s+(.*)", line)
-        if num:
-            close_lists(0)
-            out.append(f"<li>{num.group(2)}</li>")
-            continue
+    html = md.render(text)
 
-        if line.strip() == "":
-            close_lists(0)
-            out.append("<br>")
-            continue
+    # Jupyter Notebook 스타일 CSS
+    css = """<style>
+    .jupyter-markdown {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        line-height: 1.6;
+        color: #ffffff;
+    }
+    .jupyter-markdown h1 {
+        font-size: 2em;
+        border-bottom: 1px solid #e0e0e0;
+        padding-bottom: 0.3em;
+        margin-top: 1em;
+        margin-bottom: 0.5em;
+        color: #f0b429;
+        font-weight: 600;
+    }
+    .jupyter-markdown h2 {
+        font-size: 1.5em;
+        border-bottom: 1px solid #e0e0e0;
+        padding-bottom: 0.3em;
+        margin-top: 1em;
+        margin-bottom: 0.5em;
+        color: #f0b429;
+        font-weight: 600;
+    }
+    .jupyter-markdown h3 {
+        font-size: 1.25em;
+        margin-top: 1em;
+        margin-bottom: 0.5em;
+        color: #f0b429;
+        font-weight: 600;
+    }
+    .jupyter-markdown h4 {
+        font-size: 1em;
+        margin-top: 1em;
+        margin-bottom: 0.5em;
+        color: #f0b429;
+        font-weight: 600;
+    }
+    .jupyter-markdown pre {
+        background: #f7f7f7;
+        border: 1px solid #e0e0e0;
+        border-radius: 4px;
+        padding: 16px;
+        overflow: auto;
+        font-size: 85%;
+        line-height: 1.45;
+        margin: 1em 0;
+    }
+    .jupyter-markdown code {
+        background: rgba(27,31,35,0.05);
+        border-radius: 3px;
+        padding: 0.2em 0.4em;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+        font-size: 85%;
+    }
+    .jupyter-markdown pre code {
+        background: transparent;
+        padding: 0;
+        border-radius: 0;
+        font-size: 100%;
+    }
+    .jupyter-markdown blockquote {
+        border-left: 4px solid #dfe2e5;
+        padding-left: 16px;
+        color: #6a737d;
+        margin: 0 0 1em 0;
+    }
+    .jupyter-markdown table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1em 0;
+        overflow: auto;
+        display: block;
+    }
+    .jupyter-markdown th, .jupyter-markdown td {
+        border: 1px solid #dfe2e5;
+        padding: 6px 13px;
+    }
+    .jupyter-markdown th {
+        background: #f6f8fa;
+        font-weight: 600;
+    }
+    .jupyter-markdown tr:nth-child(2n) {
+        background: #f6f8fa;
+    }
+    .jupyter-markdown ul, .jupyter-markdown ol {
+        padding-left: 2em;
+        margin-bottom: 1em;
+    }
+    .jupyter-markdown li > ul, .jupyter-markdown li > ol {
+        margin-bottom: 0;
+    }
+    .jupyter-markdown li {
+        color: #ffffff;
+    }
+    .jupyter-markdown ul > li {
+        list-style-type: disc;
+    }
+    .jupyter-markdown ul > li > ul > li {
+        list-style-type: circle;
+    }
+    .jupyter-markdown img {
+        max-width: 100%;
+        box-sizing: border-box;
+    }
+    .jupyter-markdown a {
+        color: #0366d6;
+        text-decoration: none;
+    }
+    .jupyter-markdown a:hover {
+        text-decoration: underline;
+    }
+    .jupyter-markdown hr {
+        border: 0;
+        border-top: 1px solid #e0e0e0;
+        margin: 1em 0;
+    }
+    .jupyter-markdown p {
+        margin-bottom: 1em;
+    }
+    </style>"""
 
-        close_lists(0)
-        out.append(line)
-
-    close_lists(0)
-    return "\n".join(out)
+    return f'<div class="jupyter-markdown">{html}</div>{css}'
 
 
 def _enrich_chunk(doc: Document) -> Document:

@@ -255,6 +255,25 @@ class TestCleanAnswer(unittest.TestCase):
         self.assertNotIn("<br/>", result)
         self.assertIn("\n", result)
 
+    def test_preserves_leading_indentation_for_nested_lists(self):
+        # 하위 불릿의 2칸 들여쓰기가 보존되어야 CommonMark 중첩 목록(●/○)이 유지된다
+        md = "- 상위\n  - 하위1\n  - 하위2"
+        result = self.m._clean_answer(md)
+        self.assertIn("\n  - 하위1", result)
+        self.assertIn("\n  - 하위2", result)
+
+    def test_nested_list_renders_nested_ul(self):
+        # _clean_answer를 거친 뒤에도 _md_to_html이 중첩 <ul>을 생성해야 한다
+        md = "## 제목\n- 상위\n  - 하위"
+        html = self.m._md_to_html(self.m._clean_answer(md))
+        self.assertGreaterEqual(html.count("<ul>"), 2)
+        self.assertIn("하위", html)
+
+    def test_collapses_midline_double_spaces(self):
+        # 줄 중간/끝의 중복 공백은 여전히 1칸으로 압축되어야 한다 (회귀 방지)
+        result = self.m._clean_answer("a  b   c")
+        self.assertEqual(result, "a b c")
+
 
 class TestReranker(unittest.TestCase):
     def setUp(self):
@@ -365,6 +384,86 @@ class TestAnswerCache(unittest.TestCase):
             except Exception:
                 pass
             mock_ret.assert_called_once()
+
+
+class TestMdToHtml(unittest.TestCase):
+    def setUp(self):
+        self.m = _load_qa({})
+
+    def test_empty_string_returns_empty(self):
+        result = self.m._md_to_html("")
+        self.assertEqual(result, "")
+
+    def test_whitespace_only_returns_empty(self):
+        result = self.m._md_to_html("   \n   ")
+        self.assertEqual(result, "")
+
+    def test_headers_rendered(self):
+        md = "# 제목\n## 부제목\n### 소제목\n"
+        result = self.m._md_to_html(md)
+        self.assertIn("<h1>", result)
+        self.assertIn("제목</h1>", result)
+        self.assertIn("<h2>", result)
+        self.assertIn("부제목</h2>", result)
+        self.assertIn("<h3>", result)
+        self.assertIn("소제목</h3>", result)
+        self.assertIn('class="jupyter-markdown"', result)
+
+    def test_code_block_with_highlighting(self):
+        md = "```python\nprint('hello')\n```"
+        result = self.m._md_to_html(md)
+        self.assertIn("<pre>", result)
+        self.assertIn("<code", result)
+        self.assertIn("print", result)
+
+    def test_inline_code(self):
+        md = "이것은 `inline code` 입니다"
+        result = self.m._md_to_html(md)
+        self.assertIn("<code>", result)
+        self.assertIn("inline code", result)
+
+    def test_table_rendered(self):
+        md = "| A | B |\n|---|---|\n| 1 | 2 |"
+        result = self.m._md_to_html(md)
+        self.assertIn("<table>", result)
+        self.assertIn("<th>", result)
+        self.assertIn("<td>", result)
+
+    def test_bullet_list(self):
+        md = "- 항목1\n- 항목2\n  - 하위항목"
+        result = self.m._md_to_html(md)
+        self.assertIn("<ul>", result)
+        self.assertIn("<li>", result)
+        self.assertIn("항목1", result)
+        self.assertIn("항목2", result)
+        self.assertIn("하위항목", result)
+
+    def test_ordered_list(self):
+        md = "1. 첫째\n2. 둘째"
+        result = self.m._md_to_html(md)
+        self.assertIn("<ol>", result)
+        self.assertIn("<li>", result)
+        self.assertIn("첫째", result)
+        self.assertIn("둘째", result)
+
+    def test_blockquote(self):
+        md = "> 인용문입니다"
+        result = self.m._md_to_html(md)
+        self.assertIn("<blockquote>", result)
+        self.assertIn("인용문입니다", result)
+
+    def test_jupyter_css_included(self):
+        md = "# 테스트"
+        result = self.m._md_to_html(md)
+        self.assertIn(".jupyter-markdown", result)
+        self.assertIn("<style>", result)
+
+    def test_fallback_when_import_missing(self):
+        with patch.dict(sys.modules, {"markdown_it": None, "pygments": None}):
+            m = _load_qa({})
+            result = m._md_to_html("hello\nworld")
+            self.assertIn("hello", result)
+            self.assertIn("world", result)
 
 
 if __name__ == "__main__":
