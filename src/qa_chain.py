@@ -11,10 +11,12 @@ load_dotenv()
 
 OFFLINE_MODE       = os.getenv("OFFLINE_MODE", "false").lower() == "true"
 UPSTAGE_API_KEY    = os.getenv("UPSTAGE_API_KEY", "")
-LLM_BACKEND        = os.getenv("LLM_BACKEND", "upstage").lower()  # "upstage" | "llama3"
+LLM_BACKEND        = os.getenv("LLM_BACKEND", "upstage").lower()  # "upstage" | "llama3" | "qwen"
 HF_TOKEN           = os.getenv("HF_TOKEN", "")
-LLAMA_MODEL_ID     = os.getenv("LLAMA_MODEL_ID", "meta-llama/Meta-Llama-3-8B-Instruct")
-LLAMA_LOAD_IN_8BIT = os.getenv("LLAMA_LOAD_IN_8BIT", "true").lower() == "true"
+LOCAL_MODEL_ID     = os.getenv("LOCAL_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
+LLAMA_LOAD_IN_8BIT    = os.getenv("LLAMA_LOAD_IN_8BIT", "true").lower() == "true"
+LLAMA_TEMPERATURE     = float(os.getenv("LLAMA_TEMPERATURE", "0.3"))
+LLAMA_MAX_NEW_TOKENS  = int(os.getenv("LLAMA_MAX_NEW_TOKENS", "512"))
 
 _llama_llm_cache: Any | None = None
 _answer_cache: dict[tuple[int, str], dict] = {}
@@ -36,9 +38,8 @@ _UPSTAGE_SYSTEM_PROMPT = """\
 참고 문서:
 {context}"""
 
-_LLAMA3_TEMPLATE = (
-    "<|begin_of_text|>"
-    "<|start_header_id|>system<|end_header_id|>\n\n"
+_LOCAL_LLM_TEMPLATE = (
+    "<|im_start|>system\n"
     "당신은 추천 시스템 대회 전문 AI 코치입니다.\n"
     "아래 참고 문서를 바탕으로 질문에 정확하고 구체적으로 답변하세요.\n\n"
     "규칙:\n"
@@ -49,11 +50,11 @@ _LLAMA3_TEMPLATE = (
     "- 답변은 한국어로 작성하세요.\n"
     "- 날짜나 기간이 여러 개 나열될 때는 반드시 과거에서 현재 순서(오름차순)로 배치하세요.\n\n"
     "참고 문서:\n{context}"
-    "<|eot_id|>"
-    "<|start_header_id|>user<|end_header_id|>\n\n"
+    "<|im_end|>\n"
+    "<|im_start|>user\n"
     "{question}"
-    "<|eot_id|>"
-    "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n"
 )
 
 # ── 노이즈 전처리 ─────────────────────────────────────────────────────────────
@@ -316,14 +317,18 @@ def _get_llama_llm():
     from langchain_huggingface import HuggingFacePipeline
 
     kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
-    tokenizer = AutoTokenizer.from_pretrained(LLAMA_MODEL_ID, **kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID, **kwargs)
+
+    # ChatML 계열(<|im_end|>)과 eos를 모두 stop token으로 등록
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    terminators = list({tokenizer.eos_token_id, im_end_id} - {None})
 
     quant_config = None
     if LLAMA_LOAD_IN_8BIT and torch.cuda.is_available():
         quant_config = BitsAndBytesConfig(load_in_8bit=True)
 
     model = AutoModelForCausalLM.from_pretrained(
-        LLAMA_MODEL_ID,
+        LOCAL_MODEL_ID,
         device_map="auto",
         torch_dtype=torch.float16,
         quantization_config=quant_config,
@@ -334,10 +339,15 @@ def _get_llama_llm():
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=512,
-        do_sample=False,
+        max_new_tokens=LLAMA_MAX_NEW_TOKENS,
+        do_sample=True,
+        temperature=LLAMA_TEMPERATURE,
+        top_p=0.9,
+        repetition_penalty=1.15,
+        eos_token_id=terminators,
         return_full_text=False,
         pad_token_id=tokenizer.eos_token_id,
+        tokenizer_kwargs={"add_special_tokens": False},
     )
     _llama_llm_cache = HuggingFacePipeline(pipeline=pipe)
     return _llama_llm_cache
@@ -345,7 +355,7 @@ def _get_llama_llm():
 
 def _get_llama_prompt():
     from langchain_core.prompts import PromptTemplate
-    return PromptTemplate(input_variables=["context", "question"], template=_LLAMA3_TEMPLATE)
+    return PromptTemplate(input_variables=["context", "question"], template=_LOCAL_LLM_TEMPLATE)
 
 
 # ── 하이브리드 검색 ───────────────────────────────────────────────────────────
@@ -410,7 +420,7 @@ def answer_question(vectorstore: FAISS, question: str) -> dict[str, Any]:
         )
         return chain.invoke(question)
 
-    if LLM_BACKEND == "llama3":
+    if LLM_BACKEND in ("llama3", "qwen"):
         raw_answer = _run_chain(_get_llama_llm(), _get_llama_prompt())
         result = {"answer": _clean_answer(raw_answer), "sources": context_docs}
         _answer_cache[cache_key] = result
