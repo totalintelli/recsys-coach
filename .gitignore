@@ -219,3 +219,9 @@ __marimo__/
 
 .env
 *.csv
+
+# macOS
+.DS_Store
+
+# Claude Code planning docs
+plans/
