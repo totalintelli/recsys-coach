@@ -20,3 +20,20 @@ sentence-transformers>=2.6
 pytest>=8.0
 markdown-it-py>=3.0
 pygments>=2.0
+
+# cudf (RAPIDS) — pip install -r requirements.txt 로는 설치 불가, 아래 명령 별도 실행
+# 검증 환경: RTX 3090, CUDA Driver 12.2 (535.86.10). 드라이버가 12.2이므로 CUDA 12 계열로 통일해야 함.
+#
+# 1) cudf + cupy를 CUDA 12 stable로 설치 (nightly/cu13 휠은 12.2 드라이버에서 CUDA_ERROR_INVALID_IMAGE 발생):
+#   pip install "cudf-cu12>=24.10,<24.13" "cupy-cuda12x>=13,<14" --extra-index-url=https://pypi.nvidia.com
+#
+# 2) cupy가 libnvrtc.so.12 를 못 찾으면 (cu13 휠이 표준 lib 경로 선점) NVRTC 12 경로를 LD_LIBRARY_PATH 앞에 추가:
+#   export LD_LIBRARY_PATH=/opt/conda/envs/recsys/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib:$LD_LIBRARY_PATH
+#   (영구화: 위 export 한 줄을 ~/.bashrc 에 추가)
+#
+# 3) numba 패치 충돌 (RuntimeError: Cannot patch Numba ... numba_cuda includes patches from pynvjitlink) 시 제거:
+#   pip uninstall -y numba-cuda
+#   (cudf가 의존성으로 끌어오지만, describe 등 핵심 연산은 numba-cuda 없이 동작.
+#    cudf 24.12에서는 NUMBA_CUDA_ENABLE_PYNVJITLINK 환경변수 우회가 안 통함)
+#
+# 검증: python -c "import cudf; print(cudf.DataFrame({'a':[1,2,3]}).describe())"
