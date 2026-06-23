@@ -225,3 +225,6 @@ __marimo__/
 
 # Claude Code planning docs
 plans/
+
+# Claude Code local settings
+.claude/settings.json
