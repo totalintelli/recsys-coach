@@ -226,5 +226,5 @@ __marimo__/
 # Claude Code planning docs
 plans/
 
-# Claude Code local settings
-.claude/settings.json
+# Claude Code config (agents/skills/settings) — 로컬 개발 도구, 제품 일부 아님
+.claude/
