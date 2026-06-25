@@ -14,11 +14,14 @@ UPSTAGE_API_KEY    = os.getenv("UPSTAGE_API_KEY", "")
 LLM_BACKEND        = os.getenv("LLM_BACKEND", "upstage").lower()  # "upstage" | "llama3" | "qwen"
 HF_TOKEN           = os.getenv("HF_TOKEN", "")
 LOCAL_MODEL_ID     = os.getenv("LOCAL_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
-LLAMA_LOAD_IN_8BIT    = os.getenv("LLAMA_LOAD_IN_8BIT", "true").lower() == "true"
-LLAMA_TEMPERATURE     = float(os.getenv("LLAMA_TEMPERATURE", "0.3"))
+# 기본 fp16: 8bit는 dequant 오버헤드로 추론이 느리다. Qwen 3B fp16≈6GB라 24GB GPU에 여유.
+# VRAM이 빠듯하면 LLAMA_LOAD_IN_8BIT=true로 8bit 복귀.
+LLAMA_LOAD_IN_8BIT    = os.getenv("LLAMA_LOAD_IN_8BIT", "false").lower() == "true"
+LLAMA_TEMPERATURE     = float(os.getenv("LLAMA_TEMPERATURE", "0"))  # 0=greedy(QA 권장·더 빠름), >0=sampling
 LLAMA_MAX_NEW_TOKENS  = int(os.getenv("LLAMA_MAX_NEW_TOKENS", "512"))
 
 _llama_llm_cache: Any | None = None
+_reranker_cache: Any | None = None  # CrossEncoder는 질문마다 재로딩하면 느려 모듈 캐시
 _answer_cache: dict[tuple[int, str], dict] = {}
 
 # ── 프롬프트 ──────────────────────────────────────────────────────────────────
@@ -270,9 +273,12 @@ def _split_documents(docs: list[Document]) -> list[Document]:
 
 def _rerank_with_cross_encoder(query: str, docs: list[Document], top_k: int = 3) -> list[Document]:
     """Cross-Encoder로 문서를 재순위한다. sentence-transformers 미설치 시 단순 슬라이스 fallback."""
+    global _reranker_cache
     try:
-        from sentence_transformers import CrossEncoder
-        model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        if _reranker_cache is None:  # 첫 호출 1회만 로딩, 이후 재사용
+            from sentence_transformers import CrossEncoder
+            _reranker_cache = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        model = _reranker_cache
         scores = model.predict([(query, doc.page_content) for doc in docs])
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
         return [doc for _, doc in ranked[:top_k]]
@@ -335,20 +341,22 @@ def _get_llama_llm():
         **kwargs,
     )
 
-    pipe = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
+    # QA(사실 추출)는 greedy가 sampling보다 빠르고 결정적이다. temp<=0이면 greedy로,
+    # temp>0이면 기존 sampling 동작 유지(LLAMA_TEMPERATURE로 토글). greedy 시 top_p/temperature는
+    # 무의미하므로 generate에 넘기지 않는다(경고 방지).
+    gen_kwargs = dict(
         max_new_tokens=LLAMA_MAX_NEW_TOKENS,
-        do_sample=True,
-        temperature=LLAMA_TEMPERATURE,
-        top_p=0.9,
         repetition_penalty=1.15,
         eos_token_id=terminators,
         return_full_text=False,
         pad_token_id=tokenizer.eos_token_id,
-        tokenizer_kwargs={"add_special_tokens": False},
     )
+    if LLAMA_TEMPERATURE > 0:
+        gen_kwargs.update(do_sample=True, temperature=LLAMA_TEMPERATURE, top_p=0.9)
+    else:
+        gen_kwargs.update(do_sample=False)
+
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, **gen_kwargs)
     _llama_llm_cache = HuggingFacePipeline(pipeline=pipe)
     return _llama_llm_cache
 
@@ -385,35 +393,62 @@ def build_vectorstore(docs: list[Document]) -> FAISS:
     return vs
 
 
-def answer_question(vectorstore: FAISS, question: str) -> dict[str, Any]:
-    """{'answer': str, 'sources': list[Document]} 반환"""
+def warm_up_llm() -> None:
+    """로컬 LLM(LLaMA/Qwen)을 미리 로딩해 캐시에 채운다.
+
+    첫 질문이 '모델 로딩 + 추론'을 한꺼번에 떠안아 WebSocket 타임아웃이 나는 것을 막는다.
+    문서 인덱싱 직후(이미 spinner가 도는 구간)에 호출하면 실제 질문은 추론만 한다.
+    Upstage(API)·OFFLINE 모드는 로딩이 없으므로 아무 것도 하지 않는다.
+    """
+    # 리랭커도 첫 질문에서 분리(질문마다 재로딩하던 것을 미리 캐시).
+    _rerank_with_cross_encoder("warm up", [Document(page_content="warm up")], top_k=1)
+    if not OFFLINE_MODE and LLM_BACKEND in ("llama3", "qwen"):
+        _get_llama_llm()  # 캐시(_llama_llm_cache)를 채운다
+
+
+def answer_question(vectorstore: FAISS, question: str, progress=None) -> dict[str, Any]:
+    """{'answer': str, 'sources': list[Document]} 반환.
+
+    progress: 선택적 콜백 (label: str) -> None. 각 단계 시작 시 호출돼 진행 상황을
+    UI에 표시한다. None이면(기본) 아무 것도 하지 않아 기존 호출부와 호환된다.
+    """
+    def _step(label: str) -> None:
+        if progress is not None:
+            progress(label)
+
     # ── 캐시 확인 ────────────────────────────────────────────────────────────
     cache_key = (id(vectorstore), question)
     if cache_key in _answer_cache:
+        _step("캐시된 답변 사용")
         return _answer_cache[cache_key]
 
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.runnables import RunnablePassthrough
 
+    _step("문서 검색 (BM25 + FAISS)")
     chunks = getattr(vectorstore, "_chunks", None) or []
     retriever = _build_retriever(vectorstore, chunks)
     source_docs = retriever.invoke(question)
 
     # Cross-Encoder reranking → 상위 3개
+    _step("관련도 재정렬 (Cross-Encoder)")
     context_docs = _rerank_with_cross_encoder(question, source_docs, top_k=3)
 
     if OFFLINE_MODE:
+        _step("오프라인 모드 — 검색 컨텍스트 반환")
         answer = _clean_answer("\n\n---\n\n".join(doc.page_content for doc in context_docs))
         result = {"answer": answer, "sources": context_docs}
         _answer_cache[cache_key] = result
         return result
 
-    def format_docs(docs):
-        return "\n\n---\n\n".join(doc.page_content for doc in docs)
+    # 리트리버는 위에서 이미 1회 실행해 리랭킹까지 마쳤다(context_docs).
+    # 체인 안에서 retriever를 다시 호출하면 앙상블 검색이 질문마다 2회 돌고,
+    # LLM에는 리랭킹 안 된 원본이 가는 불일치도 생긴다. 리랭킹된 컨텍스트를 그대로 주입.
+    context_text = "\n\n---\n\n".join(doc.page_content for doc in context_docs)
 
     def _run_chain(llm, prompt) -> str:
         chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            {"context": lambda _: context_text, "question": RunnablePassthrough()}
             | prompt
             | llm
             | StrOutputParser()
@@ -421,16 +456,19 @@ def answer_question(vectorstore: FAISS, question: str) -> dict[str, Any]:
         return chain.invoke(question)
 
     if LLM_BACKEND in ("llama3", "qwen"):
+        _step(f"답변 생성 ({LLM_BACKEND})")
         raw_answer = _run_chain(_get_llama_llm(), _get_llama_prompt())
         result = {"answer": _clean_answer(raw_answer), "sources": context_docs}
         _answer_cache[cache_key] = result
         return result
 
     try:
+        _step("답변 생성 (Solar-Pro)")
         raw_answer = _run_chain(_get_upstage_llm(), _get_upstage_prompt())
     except Exception as exc:
         import warnings
         warnings.warn(f"[recsys-coach] Upstage 호출 실패 ({exc!r}), Llama-3으로 폴백합니다.")
+        _step("Solar 실패 — Llama-3 폴백 생성")
         raw_answer = _run_chain(_get_llama_llm(), _get_llama_prompt())
 
     result = {"answer": _clean_answer(raw_answer), "sources": context_docs}
