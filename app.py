@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -30,11 +32,10 @@ if tab == "대회 문서 Q&A":
     if uploaded_files:
         if "vectorstore" not in st.session_state or st.session_state.get("qa_files") != [f.name for f in uploaded_files]:
             with st.spinner("문서를 분석 중입니다..."):
-                import os
                 import tempfile
 
                 from langchain_community.document_loaders import PyPDFLoader
-                from src.qa_chain import build_vectorstore
+                from src.qa_chain import build_vectorstore, warm_up_llm
 
                 docs: list[Document] = []
                 for uf in uploaded_files:
@@ -56,6 +57,9 @@ if tab == "대회 문서 Q&A":
                 st.session_state["vectorstore"] = build_vectorstore(docs)
                 st.session_state["qa_files"] = [f.name for f in uploaded_files]
                 st.session_state.setdefault("chat_history", [])
+                # 로컬 LLM을 지금 미리 로딩한다(첫 질문이 모델 로딩+추론을 한꺼번에 떠안아
+                # WebSocket 타임아웃 나는 것을 방지). Upstage/OFFLINE이면 즉시 반환.
+                warm_up_llm()
             st.success(f"{len(uploaded_files)}개 파일 인덱싱 완료")
 
     if "vectorstore" in st.session_state:
@@ -82,9 +86,15 @@ elif tab == "자동 EDA 리포트":
         info_placeholder = st.empty()
 
         # 파일 읽기도 체크리스트의 첫 항목으로 표시한다. 확장자로 CSV/Parquet 분기.
+        # 업로드 자체의 전송률은 Streamlit이 노출하지 않으므로(파일이 다 올라온 뒤 실행됨),
+        # 1GB read가 오래 걸리는 구간을 스피너 + 파일명·크기로 안내한다.
         name = getattr(source, "name", source)  # 업로더는 UploadedFile, 경로 입력은 str
-        checklist.start("데이터 파일 읽기")
-        df = pd.read_parquet(source) if str(name).endswith(".parquet") else pd.read_csv(source)
+        # getattr의 default는 항상 평가되므로 os.path.getsize를 직접 default로 쓰면
+        # 업로더(path 아님)에서 TypeError. hasattr로 분기해 path일 때만 stat 호출.
+        size_mb = (source.size if hasattr(source, "size") else os.path.getsize(source)) / 1024 / 1024
+        checklist.start(f"데이터 파일 읽기 — {name} ({size_mb:.1f}MB)")
+        with st.spinner(f"`{name}` 읽는 중… ({size_mb:.1f}MB)"):
+            df = pd.read_parquet(source) if str(name).endswith(".parquet") else pd.read_csv(source)
         checklist.complete()
         info_placeholder.write(f"데이터 크기: **{df.shape[0]:,}행 × {df.shape[1]}열**")
 
@@ -111,7 +121,6 @@ elif tab == "자동 EDA 리포트":
         else:
             st.info("CSV/Parquet 파일을 업로드하면 자동으로 EDA 리포트를 생성합니다.")
     else:
-        import os
         path = st.text_input(
             "서버 내 CSV/Parquet 파일 경로를 입력하세요",
             placeholder="/data/train.parquet",
@@ -137,9 +146,24 @@ if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
             st.markdown(question)
 
         with st.chat_message("assistant"):
+            from src.eda import Checklist
+            from src.qa_chain import answer_question
+
+            # 진행 상황을 EDA와 동일한 Checklist(단계별 소요 시간)로 상세 표시.
+            # answer_question은 단일 progress(label) 콜백만 주므로, 새 단계가 오면
+            # 직전 항목을 완료 처리하고 새 항목을 시작하는 어댑터로 잇는다.
+            progress_box = st.empty()
+            checklist = Checklist(progress_box)
+
+            def _on_step(label: str) -> None:
+                if checklist._items:  # 직전 단계 완료 처리
+                    checklist.complete()
+                checklist.start(label)
+
             with st.spinner("답변 생성 중..."):
-                from src.qa_chain import answer_question
-                result = answer_question(st.session_state["vectorstore"], question)
+                result = answer_question(st.session_state["vectorstore"], question, progress=_on_step)
+                checklist.complete()  # 마지막 단계 완료
+            progress_box.empty()  # 답변이 나오면 진행 표시는 정리
 
             if result["sources"]:
                 seen = set()
