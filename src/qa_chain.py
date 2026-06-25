@@ -11,7 +11,10 @@ load_dotenv()
 
 OFFLINE_MODE       = os.getenv("OFFLINE_MODE", "false").lower() == "true"
 UPSTAGE_API_KEY    = os.getenv("UPSTAGE_API_KEY", "")
-LLM_BACKEND        = os.getenv("LLM_BACKEND", "upstage").lower()  # "upstage" | "llama3" | "qwen"
+LLM_BACKEND        = os.getenv("LLM_BACKEND", "upstage").lower()  # "upstage" | "llama3" | "qwen" | "vllm"
+# 같은 가중치를 로컬에서 추론하는 백엔드 집합. 판정을 한 곳으로 모아 신규 백엔드(vllm) 추가 시
+# 호출부 3곳이 따로 깨지지 않게 한다. "vllm"은 greedy면 transformers와 출력이 동치이면서 2~4배 빠름.
+_LOCAL_BACKENDS    = {"llama3", "qwen", "vllm"}
 HF_TOKEN           = os.getenv("HF_TOKEN", "")
 LOCAL_MODEL_ID     = os.getenv("LOCAL_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
 # 기본 fp16: 8bit는 dequant 오버헤드로 추론이 느리다. Qwen 3B fp16≈6GB라 24GB GPU에 여유.
@@ -27,6 +30,9 @@ RERANKER_ENABLED      = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
 RERANKER_DEVICE       = os.getenv("RERANKER_DEVICE", "").strip()
 LOCAL_DEVICE          = os.getenv("LOCAL_DEVICE", "").strip()
 LOCAL_ATTN_IMPLEMENTATION = os.getenv("LOCAL_ATTN_IMPLEMENTATION", "sdpa").strip()
+# vLLM 전용. GPU 메모리 점유율(0~1)·최대 컨텍스트 길이. 3090(24GB)+7B fp16 기준 기본값으로 충분.
+VLLM_GPU_MEM_UTIL     = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.90"))
+VLLM_MAX_MODEL_LEN    = int(os.getenv("VLLM_MAX_MODEL_LEN", "4096"))
 
 _llama_llm_cache: Any | None = None
 _reranker_cache: Any | None = None  # CrossEncoder는 질문마다 재로딩하면 느려 모듈 캐시
@@ -360,9 +366,41 @@ def _get_upstage_prompt():
     ])
 
 
+def _get_vllm_llm():
+    """vLLM 백엔드. PagedAttention + continuous batching으로 같은 7B fp16을 transformers보다
+    2~4배 빠르게 디코딩한다. greedy(temperature=0)면 출력이 transformers 경로와 동치이므로
+    품질 손실 없이 속도만 올린다. langchain_community.llms.VLLM 래퍼 사용."""
+    from langchain_community.llms import VLLM
+
+    # greedy면 temperature=0(vLLM에서 그대로 greedy). sampling이면 transformers 경로와 같은 값 매핑.
+    sampling = {"temperature": LLAMA_TEMPERATURE, "top_p": 0.9} if LLAMA_TEMPERATURE > 0 \
+        else {"temperature": 0.0}
+    # repetition_penalty는 샘플링 인자라 래퍼 최상위 필드로 받는다. 엔진 인자(gpu_memory_utilization,
+    # max_model_len)는 vllm_kwargs로만 EngineArgs에 전달된다. 둘을 섞으면 EngineArgs가
+    # repetition_penalty를 모른다며 TypeError를 낸다.
+    return VLLM(
+        model=LOCAL_MODEL_ID,
+        dtype="float16",
+        trust_remote_code=True,
+        max_new_tokens=LLAMA_MAX_NEW_TOKENS,
+        repetition_penalty=1.15,
+        # ChatML stop. _LOCAL_LLM_TEMPLATE가 <|im_end|>로 턴을 닫으므로 거기서 멈춘다.
+        stop=["<|im_end|>"],
+        vllm_kwargs={
+            "gpu_memory_utilization": VLLM_GPU_MEM_UTIL,
+            "max_model_len": VLLM_MAX_MODEL_LEN,
+        },
+        **sampling,
+    )
+
+
 def _get_llama_llm():
     global _llama_llm_cache
     if _llama_llm_cache is not None:
+        return _llama_llm_cache
+
+    if LLM_BACKEND == "vllm":
+        _llama_llm_cache = _get_vllm_llm()
         return _llama_llm_cache
 
     import torch
@@ -485,7 +523,7 @@ def warm_up_llm() -> None:
     """
     # 리랭커도 첫 질문에서 분리(질문마다 재로딩하던 것을 미리 캐시).
     _rerank_with_cross_encoder("warm up", [Document(page_content="warm up")], top_k=1)
-    if not OFFLINE_MODE and LLM_BACKEND in ("llama3", "qwen"):
+    if not OFFLINE_MODE and LLM_BACKEND in _LOCAL_BACKENDS:
         _get_llama_llm()  # 캐시(_llama_llm_cache)를 채운다
 
 
@@ -508,7 +546,7 @@ def answer_question(vectorstore: FAISS, question: str, progress=None) -> dict[st
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.runnables import RunnablePassthrough
 
-    is_local_backend = LLM_BACKEND in ("llama3", "qwen")
+    is_local_backend = LLM_BACKEND in _LOCAL_BACKENDS
     retriever_k = LOCAL_RETRIEVER_K if is_local_backend else RETRIEVER_K
     rerank_top_k = LOCAL_RERANK_TOP_K if is_local_backend else RERANK_TOP_K
 

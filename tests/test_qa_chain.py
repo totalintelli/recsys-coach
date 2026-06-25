@@ -143,6 +143,35 @@ class TestBackendRouting(unittest.TestCase):
             mock_llama.assert_called_once()
             mock_upstage.assert_not_called()
 
+    def test_vllm_backend_routes_to_local(self):
+        # vllm도 로컬 백엔드 집합이라 _get_llama_llm 경로로 가고, Upstage는 호출되지 않아야 한다.
+        m = _load_qa({"OFFLINE_MODE": "false", "LLM_BACKEND": "vllm"})
+        m._answer_cache = {}
+        vs, _ = _mock_vectorstore()
+        with patch.object(m, "_build_retriever") as mock_ret, \
+             patch.object(m, "_rerank_with_cross_encoder", return_value=[]), \
+             patch.object(m, "_get_llama_llm") as mock_llama, \
+             patch.object(m, "_get_llama_prompt") as mock_prompt, \
+             patch.object(m, "_get_upstage_llm") as mock_upstage:
+            mock_ret.return_value.invoke.return_value = []
+            mock_llama.return_value = MagicMock()
+            mock_prompt.return_value = MagicMock()
+            try:
+                m.answer_question(vs, "question")
+            except Exception:
+                pass
+            mock_llama.assert_called_once()
+            mock_upstage.assert_not_called()
+
+    def test_vllm_backend_dispatches_to_vllm_builder(self):
+        # LLM_BACKEND=vllm이면 _get_llama_llm이 transformers가 아니라 _get_vllm_llm으로 분기한다.
+        m = _load_qa({"OFFLINE_MODE": "false", "LLM_BACKEND": "vllm"})
+        m._llama_llm_cache = None
+        sentinel = MagicMock()
+        with patch.object(m, "_get_vllm_llm", return_value=sentinel) as mock_vllm:
+            self.assertIs(m._get_llama_llm(), sentinel)
+            mock_vllm.assert_called_once()
+
     def test_upstage_fallback_on_exception(self):
         m = _load_qa({"OFFLINE_MODE": "false", "LLM_BACKEND": "upstage", "UPSTAGE_API_KEY": "x"})
         m._answer_cache = {}
