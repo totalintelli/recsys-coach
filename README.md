@@ -135,6 +135,20 @@ python -m pytest tests/test_qa_chain.py::test_name -v
 
 ---
 
+## 주요 트러블슈팅
+
+### Q&A 답변이 `[object Object]`로 깨지던 버그
+
+코드 블록이 포함된 답변이 `[object Object]` 박스로 렌더되던 문제를 **근본 원인 수준에서** 해결했습니다.
+
+- **원인:** 마크다운을 HTML로 재구현한 `_md_to_html`(165줄)의 출력을 `st.markdown(..., unsafe_allow_html=True)`로 주입했는데, Streamlit이 그 HTML을 자체 렌더 파이프라인으로 재파싱하다 코드 블록을 깨뜨려 JS가 `[object Object]`로 강제변환.
+- **해결:** Streamlit이 기본 제공하는 `st.markdown(text)` 마크다운 렌더링으로 교체하고 `_md_to_html` 및 의존성(markdown-it-py, pygments)을 제거. **net −113줄**, 의존성 2개 감소.
+- **재발 방지:** LLM 출력 노이즈 패턴에 대한 회귀 테스트 5건 추가. (상세: [PORTFOLIO.md](PORTFOLIO.md) §4, [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md))
+
+> 증상이 난 경로만 패치하지 않고 렌더러(근본 원인)를 고쳐, 버그 수정과 코드 감축을 동시에 달성한 사례입니다.
+
+---
+
 ## 주의사항
 
 - `.env`, `*.csv`, `.streamlit/secrets.toml` 파일은 절대 커밋하지 마세요.
