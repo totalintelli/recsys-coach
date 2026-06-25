@@ -31,12 +31,13 @@ if tab == "대회 문서 Q&A":
 
     if uploaded_files:
         if "vectorstore" not in st.session_state or st.session_state.get("qa_files") != [f.name for f in uploaded_files]:
-            with st.spinner("문서를 분석 중입니다..."):
+            with st.status("대회 문서 Q&A 준비 중...", expanded=True) as status:
                 import tempfile
 
                 from langchain_community.document_loaders import PyPDFLoader
                 from src.qa_chain import build_vectorstore, warm_up_llm
 
+                st.write("업로드된 문서를 읽는 중입니다.")
                 docs: list[Document] = []
                 for uf in uploaded_files:
                     raw = uf.read()
@@ -54,12 +55,17 @@ if tab == "대회 문서 Q&A":
                         text = raw.decode("utf-8", errors="ignore")
                         docs.append(Document(page_content=text, metadata={"source": uf.name}))
 
+                status.update(label="문서 벡터 인덱스 생성 중...", state="running", expanded=True)
+                st.write("검색용 벡터 인덱스를 생성하는 중입니다.")
                 st.session_state["vectorstore"] = build_vectorstore(docs)
                 st.session_state["qa_files"] = [f.name for f in uploaded_files]
                 st.session_state.setdefault("chat_history", [])
                 # 로컬 LLM을 지금 미리 로딩한다(첫 질문이 모델 로딩+추론을 한꺼번에 떠안아
                 # WebSocket 타임아웃 나는 것을 방지). Upstage/OFFLINE이면 즉시 반환.
+                status.update(label="LLM 모델 준비 중...", state="running", expanded=True)
+                st.write("Qwen 같은 로컬 모델은 GPU 로딩에 시간이 걸릴 수 있습니다.")
                 warm_up_llm()
+                status.update(label="대회 문서 Q&A 준비 완료", state="complete", expanded=False)
             st.success(f"{len(uploaded_files)}개 파일 인덱싱 완료")
 
     if "vectorstore" in st.session_state:
@@ -146,24 +152,29 @@ if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
             st.markdown(question)
 
         with st.chat_message("assistant"):
-            from src.eda import Checklist
             from src.qa_chain import answer_question
 
-            # 진행 상황을 EDA와 동일한 Checklist(단계별 소요 시간)로 상세 표시.
-            # answer_question은 단일 progress(label) 콜백만 주므로, 새 단계가 오면
-            # 직전 항목을 완료 처리하고 새 항목을 시작하는 어댑터로 잇는다.
-            progress_box = st.empty()
-            checklist = Checklist(progress_box)
+            # answer_question의 progress(label)를 화면에 직접 남겨, 검색/리랭킹/생성
+            # 중 어느 단계에서 시간이 걸리는지 확인할 수 있게 한다.
+            with st.status("답변 생성 준비 중...", expanded=True) as status:
+                progress_log = st.empty()
+                progress_steps: list[str] = []
 
-            def _on_step(label: str) -> None:
-                if checklist._items:  # 직전 단계 완료 처리
-                    checklist.complete()
-                checklist.start(label)
+                def _on_step(label: str) -> None:
+                    progress_steps.append(label)
+                    status.update(label=label, state="running", expanded=True)
+                    progress_log.markdown(
+                        "\n".join(f"- {step}" for step in progress_steps)
+                    )
 
-            with st.spinner("답변 생성 중..."):
                 result = answer_question(st.session_state["vectorstore"], question, progress=_on_step)
-                checklist.complete()  # 마지막 단계 완료
-            progress_box.empty()  # 답변이 나오면 진행 표시는 정리
+                status.update(label="답변 생성 완료", state="complete", expanded=False)
+
+            # 정리 후 내용이 비면(노이즈만 있던 경우) 빈 화면 대신 안내만 출력하고 종료.
+            answer_text = (result["answer"] or "").strip()
+            if not answer_text:
+                st.info("문서에서 답변할 내용을 찾지 못했습니다. 질문을 바꿔보세요.")
+                st.stop()
 
             if result["sources"]:
                 seen = set()

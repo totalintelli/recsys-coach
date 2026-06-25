@@ -18,10 +18,19 @@ LOCAL_MODEL_ID     = os.getenv("LOCAL_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
 # VRAM이 빠듯하면 LLAMA_LOAD_IN_8BIT=true로 8bit 복귀.
 LLAMA_LOAD_IN_8BIT    = os.getenv("LLAMA_LOAD_IN_8BIT", "false").lower() == "true"
 LLAMA_TEMPERATURE     = float(os.getenv("LLAMA_TEMPERATURE", "0"))  # 0=greedy(QA 권장·더 빠름), >0=sampling
-LLAMA_MAX_NEW_TOKENS  = int(os.getenv("LLAMA_MAX_NEW_TOKENS", "512"))
+LLAMA_MAX_NEW_TOKENS  = int(os.getenv("LLAMA_MAX_NEW_TOKENS", "256"))
+RETRIEVER_K           = int(os.getenv("RETRIEVER_K", "6"))
+LOCAL_RETRIEVER_K     = int(os.getenv("LOCAL_RETRIEVER_K", "4"))
+RERANK_TOP_K          = int(os.getenv("RERANK_TOP_K", "3"))
+LOCAL_RERANK_TOP_K    = int(os.getenv("LOCAL_RERANK_TOP_K", "2"))
+RERANKER_ENABLED      = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
+RERANKER_DEVICE       = os.getenv("RERANKER_DEVICE", "").strip()
+LOCAL_DEVICE          = os.getenv("LOCAL_DEVICE", "").strip()
+LOCAL_ATTN_IMPLEMENTATION = os.getenv("LOCAL_ATTN_IMPLEMENTATION", "sdpa").strip()
 
 _llama_llm_cache: Any | None = None
 _reranker_cache: Any | None = None  # CrossEncoder는 질문마다 재로딩하면 느려 모듈 캐시
+_retriever_cache: dict[tuple[int, int], Any] = {}
 _answer_cache: dict[tuple[int, str], dict] = {}
 
 # ── 프롬프트 ──────────────────────────────────────────────────────────────────
@@ -34,8 +43,11 @@ _UPSTAGE_SYSTEM_PROMPT = """\
 - 문서에 명시된 내용을 우선하고, 문서에 없는 내용은 "문서에서 확인할 수 없습니다"라고 답변하세요.
 - 코드나 수식이 포함된 경우 마크다운 코드 블록(```python)을 사용하세요.
 - 답변의 핵심 주제가 있으면 ## 헤더로 제목을 붙이세요.
+- 본문 내용이 없는 제목이나 섹션은 만들지 마세요.
 - 목록이나 단계가 있는 경우 번호 목록 또는 불릿 목록으로 정리하고, 하위 항목은 들여쓰기 불릿(  - )으로 계층을 표현하세요.
 - 답변은 한국어로, 명확하고 간결하게 작성하세요.
+- 답변 본문은 반드시 한국어만 사용하고, 중국어·일본어 표현을 섞지 마세요.
+- 코드, 파일명, 함수명, 컬럼명, 모델명, API명 같은 고유 식별자는 원문 표기를 유지할 수 있습니다.
 - 날짜나 기간이 여러 개 나열될 때는 반드시 과거에서 현재 순서(오름차순)로 배치하세요.
 
 참고 문서:
@@ -49,8 +61,11 @@ _LOCAL_LLM_TEMPLATE = (
     "- 문서에 명시된 내용을 우선하고, 문서에 없는 내용은 '문서에서 확인할 수 없습니다'라고 답변하세요.\n"
     "- 코드나 수식이 포함된 경우 마크다운 코드 블록을 사용하세요.\n"
     "- 답변의 핵심 주제가 있으면 ## 헤더로 제목을 붙이세요.\n"
+    "- 본문 내용이 없는 제목이나 섹션은 만들지 마세요.\n"
     "- 목록이나 단계가 있는 경우 불릿 목록으로 정리하고, 하위 항목은 들여쓰기 불릿(  - )으로 계층을 표현하세요.\n"
-    "- 답변은 한국어로 작성하세요.\n"
+    "- 답변 본문은 반드시 한국어만 사용하세요.\n"
+    "- 중국어/일본어 문장, 단어, 한자, 가나를 사용하지 마세요.\n"
+    "- 코드, 파일명, 함수명, 컬럼명, 모델명, API명 같은 고유 식별자는 원문 표기를 유지할 수 있습니다.\n"
     "- 날짜나 기간이 여러 개 나열될 때는 반드시 과거에서 현재 순서(오름차순)로 배치하세요.\n\n"
     "참고 문서:\n{context}"
     "<|im_end|>\n"
@@ -78,9 +93,35 @@ def _clean_answer(text: str) -> str:
     text = text.replace("\\n", "\n").replace("\\t", "\t")
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
+    # LLM이 컨텍스트의 JS 객체 문자열화 산물([object Object])을 따라 출력하는 경우 제거.
+    # 모든 답변이 이 함수를 거치므로 출력 경계에서 한 번에 차단(_clean_text와 동일 규칙).
+    text = re.sub(r"(?:\[object Object\][,\s]*)+", "", text)
+    # [object Object] 제거 후 내용이 비어버린 코드블록(빈 박스)을 삭제 — 화면에 빈 상자만 남는 것 방지.
+    text = re.sub(r"```[^\n]*\n\s*```", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"(?<=\S) {2,}", " ", text)  # 비공백 뒤의 중복 공백만 압축 (줄머리 들여쓰기 보존 → 중첩 목록 유지)
+    text = _remove_trailing_empty_headings(text)
     return text.strip()
+
+
+def _remove_trailing_empty_headings(text: str) -> str:
+    """답변 끝에 본문 없이 남은 마크다운 제목을 제거한다."""
+    lines = text.rstrip().splitlines()
+    heading_pattern = re.compile(r"^\s{0,3}#{1,6}\s+\S.*$")
+
+    while lines and heading_pattern.match(lines[-1]):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+    return "\n".join(lines)
+
+
+def _contains_disallowed_cjk(text: str) -> bool:
+    """코드 영역을 제외한 답변 본문에 중국어/일본어 문자가 섞였는지 확인한다."""
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"`[^`\n]+`", "", text)
+    return bool(re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
 
 
 def _md_to_html(text: str) -> str:
@@ -274,10 +315,16 @@ def _split_documents(docs: list[Document]) -> list[Document]:
 def _rerank_with_cross_encoder(query: str, docs: list[Document], top_k: int = 3) -> list[Document]:
     """Cross-Encoder로 문서를 재순위한다. sentence-transformers 미설치 시 단순 슬라이스 fallback."""
     global _reranker_cache
+    if not RERANKER_ENABLED:
+        return docs[:top_k]
     try:
         if _reranker_cache is None:  # 첫 호출 1회만 로딩, 이후 재사용
             from sentence_transformers import CrossEncoder
-            _reranker_cache = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+            reranker_kwargs = {"device": RERANKER_DEVICE} if RERANKER_DEVICE else {}
+            _reranker_cache = CrossEncoder(
+                "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                **reranker_kwargs,
+            )
         model = _reranker_cache
         scores = model.predict([(query, doc.page_content) for doc in docs])
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
@@ -329,17 +376,46 @@ def _get_llama_llm():
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     terminators = list({tokenizer.eos_token_id, im_end_id} - {None})
 
+    has_cuda = torch.cuda.is_available()
+    mps_backend = getattr(torch.backends, "mps", None)
+    has_mps = bool(mps_backend and mps_backend.is_available())
+
+    if has_cuda:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     quant_config = None
-    if LLAMA_LOAD_IN_8BIT and torch.cuda.is_available():
+    if LLAMA_LOAD_IN_8BIT and has_cuda:
         quant_config = BitsAndBytesConfig(load_in_8bit=True)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        LOCAL_MODEL_ID,
-        device_map="auto",
-        torch_dtype=torch.float16,
+    torch_dtype = torch.float16 if has_cuda or has_mps else torch.float32
+    default_device = "cuda:0" if has_cuda else "mps" if has_mps else "cpu"
+    local_device = LOCAL_DEVICE or default_device
+    device_map: Any = "auto" if local_device.lower() == "auto" else {"": local_device}
+
+    model_kwargs = dict(
+        device_map=device_map,
+        torch_dtype=torch_dtype,
         quantization_config=quant_config,
-        **kwargs,
     )
+    if LOCAL_ATTN_IMPLEMENTATION:
+        model_kwargs["attn_implementation"] = LOCAL_ATTN_IMPLEMENTATION
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            LOCAL_MODEL_ID,
+            **model_kwargs,
+            **kwargs,
+        )
+    except (TypeError, ValueError, ImportError):
+        if "attn_implementation" not in model_kwargs:
+            raise
+        model_kwargs.pop("attn_implementation")
+        model = AutoModelForCausalLM.from_pretrained(
+            LOCAL_MODEL_ID,
+            **model_kwargs,
+            **kwargs,
+        )
 
     # QA(사실 추출)는 greedy가 sampling보다 빠르고 결정적이다. temp<=0이면 greedy로,
     # temp>0이면 기존 sampling 동작 유지(LLAMA_TEMPERATURE로 토글). greedy 시 top_p/temperature는
@@ -368,19 +444,26 @@ def _get_llama_prompt():
 
 # ── 하이브리드 검색 ───────────────────────────────────────────────────────────
 
-def _build_retriever(vectorstore: FAISS, chunks: list[Document]):
+def _build_retriever(vectorstore: FAISS, chunks: list[Document], k: int = RETRIEVER_K):
     """BM25 + FAISS 앙상블 리트리버를 반환한다. rank-bm25 미설치 시 FAISS만 사용."""
-    faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
+    cache_key = (id(vectorstore), k)
+    if cache_key in _retriever_cache:
+        return _retriever_cache[cache_key]
+
+    faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": k})
     try:
         from langchain_community.retrievers import BM25Retriever
         from langchain.retrievers import EnsembleRetriever
-        bm25 = BM25Retriever.from_documents(chunks, k=6)
-        return EnsembleRetriever(
+        bm25 = BM25Retriever.from_documents(chunks, k=k)
+        retriever = EnsembleRetriever(
             retrievers=[bm25, faiss_retriever],
             weights=[0.4, 0.6],
         )
     except ImportError:
-        return faiss_retriever
+        retriever = faiss_retriever
+
+    _retriever_cache[cache_key] = retriever
+    return retriever
 
 
 # ── 공개 API ─────────────────────────────────────────────────────────────────
@@ -425,14 +508,19 @@ def answer_question(vectorstore: FAISS, question: str, progress=None) -> dict[st
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.runnables import RunnablePassthrough
 
+    is_local_backend = LLM_BACKEND in ("llama3", "qwen")
+    retriever_k = LOCAL_RETRIEVER_K if is_local_backend else RETRIEVER_K
+    rerank_top_k = LOCAL_RERANK_TOP_K if is_local_backend else RERANK_TOP_K
+
     _step("문서 검색 (BM25 + FAISS)")
     chunks = getattr(vectorstore, "_chunks", None) or []
-    retriever = _build_retriever(vectorstore, chunks)
+    retriever = _build_retriever(vectorstore, chunks, k=retriever_k)
     source_docs = retriever.invoke(question)
 
-    # Cross-Encoder reranking → 상위 3개
-    _step("관련도 재정렬 (Cross-Encoder)")
-    context_docs = _rerank_with_cross_encoder(question, source_docs, top_k=3)
+    # Cross-Encoder reranking. 로컬 LLM은 기본 컨텍스트를 줄여 답변 생성 시간을 낮춘다.
+    if RERANKER_ENABLED:
+        _step("관련도 재정렬 (Cross-Encoder)")
+    context_docs = _rerank_with_cross_encoder(question, source_docs, top_k=rerank_top_k)
 
     if OFFLINE_MODE:
         _step("오프라인 모드 — 검색 컨텍스트 반환")
@@ -446,19 +534,32 @@ def answer_question(vectorstore: FAISS, question: str, progress=None) -> dict[st
     # LLM에는 리랭킹 안 된 원본이 가는 불일치도 생긴다. 리랭킹된 컨텍스트를 그대로 주입.
     context_text = "\n\n---\n\n".join(doc.page_content for doc in context_docs)
 
-    def _run_chain(llm, prompt) -> str:
+    def _run_chain(llm, prompt, input_question: str = question) -> str:
         chain = (
             {"context": lambda _: context_text, "question": RunnablePassthrough()}
             | prompt
             | llm
             | StrOutputParser()
         )
-        return chain.invoke(question)
+        return chain.invoke(input_question)
 
-    if LLM_BACKEND in ("llama3", "qwen"):
+    if is_local_backend:
         _step(f"답변 생성 ({LLM_BACKEND})")
-        raw_answer = _run_chain(_get_llama_llm(), _get_llama_prompt())
-        result = {"answer": _clean_answer(raw_answer), "sources": context_docs}
+        llm = _get_llama_llm()
+        prompt = _get_llama_prompt()
+        raw_answer = _run_chain(llm, prompt)
+        answer = _clean_answer(raw_answer)
+        if _contains_disallowed_cjk(answer):
+            _step("중국어/일본어 혼입 감지 — 한국어 답변 재생성")
+            retry_question = (
+                f"{question}\n\n"
+                "이전 답변에 중국어 또는 일본어가 섞였습니다. "
+                "답변 본문은 반드시 한국어로만 다시 작성하세요. "
+                "중국어/일본어 문장, 단어, 한자, 가나는 사용하지 마세요. "
+                "코드, 파일명, 함수명, 컬럼명, 모델명, API명 같은 고유 식별자는 원문 표기를 유지할 수 있습니다."
+            )
+            answer = _clean_answer(_run_chain(llm, prompt, input_question=retry_question))
+        result = {"answer": answer, "sources": context_docs}
         _answer_cache[cache_key] = result
         return result
 
