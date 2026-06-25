@@ -1,2 +1,7 @@
 [server]
 maxUploadSize = 1024
+# 긴 LLM 추론 중 WebSocket이 끊겨 "Connection timed out"이 나는 것을 막는다.
+# Tornado >=6.5에서 30 미만은 연결 문제를 일으킬 수 있어 30으로 둔다.
+websocketPingInterval = 30
+# 추론 도중 일시적으로 연결이 끊겨도 세션을 더 오래 유지(기본 120s → 300s).
+disconnectedSessionTTL = 300
