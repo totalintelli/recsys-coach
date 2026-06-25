@@ -73,7 +73,7 @@ if tab == "대회 문서 Q&A":
 elif tab == "자동 EDA 리포트":
     st.header("자동 EDA 리포트")
 
-    def _run_eda_from_csv(csv_source) -> None:
+    def _run_eda_from_file(source) -> None:
         from src.eda import Checklist, generate_eda
 
         # 체크리스트 placeholder를 가장 먼저 만들어 즉시 화면에 진행 상황을 띄운다.
@@ -81,48 +81,49 @@ elif tab == "자동 EDA 리포트":
         checklist = Checklist(st.empty())
         info_placeholder = st.empty()
 
-        # CSV 읽기도 체크리스트의 첫 항목으로 표시한다.
-        checklist.start("CSV 파일 읽기")
-        df = pd.read_csv(csv_source)
+        # 파일 읽기도 체크리스트의 첫 항목으로 표시한다. 확장자로 CSV/Parquet 분기.
+        name = getattr(source, "name", source)  # 업로더는 UploadedFile, 경로 입력은 str
+        checklist.start("데이터 파일 읽기")
+        df = pd.read_parquet(source) if str(name).endswith(".parquet") else pd.read_csv(source)
         checklist.complete()
         info_placeholder.write(f"데이터 크기: **{df.shape[0]:,}행 × {df.shape[1]}열**")
 
         generate_eda(df, checklist)
 
-    _UPLOAD_LIMIT_MB = 200
+    _UPLOAD_LIMIT_MB = 1024
 
     input_mode = st.radio(
         "입력 방식",
-        ["파일 업로드 (200MB)", "서버 경로 직접 입력 (대용량)"],
+        ["파일 업로드 (1GB)", "서버 경로 직접 입력 (대용량)"],
         key="eda_input_mode",
     )
 
-    if input_mode == "파일 업로드 (200MB)":
-        csv_file = st.file_uploader("CSV 파일을 업로드하세요", type=["csv"], key="eda_csv")
-        if csv_file:
-            if csv_file.size > _UPLOAD_LIMIT_MB * 1024 * 1024:
+    if input_mode == "파일 업로드 (1GB)":
+        data_file = st.file_uploader("CSV/Parquet 파일을 업로드하세요", type=["csv", "parquet"], key="eda_csv")
+        if data_file:
+            if data_file.size > _UPLOAD_LIMIT_MB * 1024 * 1024:
                 st.error(
-                    f"파일 크기가 200MB를 초과했습니다 ({csv_file.size / 1024 / 1024:.1f}MB). "
+                    f"파일 크기가 {_UPLOAD_LIMIT_MB}MB를 초과했습니다 ({data_file.size / 1024 / 1024:.1f}MB). "
                     "대용량 파일은 '서버 경로 직접 입력'을 사용하세요."
                 )
             else:
-                _run_eda_from_csv(csv_file)
+                _run_eda_from_file(data_file)
         else:
-            st.info("CSV 파일을 업로드하면 자동으로 EDA 리포트를 생성합니다.")
+            st.info("CSV/Parquet 파일을 업로드하면 자동으로 EDA 리포트를 생성합니다.")
     else:
         import os
         path = st.text_input(
-            "서버 내 CSV 파일 경로를 입력하세요",
-            placeholder="/data/train.csv",
+            "서버 내 CSV/Parquet 파일 경로를 입력하세요",
+            placeholder="/data/train.parquet",
             key="eda_path",
         )
         if st.button("EDA 시작", key="eda_start") and path:
-            if not path.endswith(".csv"):
-                st.error("CSV 파일(.csv)만 지원합니다.")
+            if not path.endswith((".csv", ".parquet")):
+                st.error("CSV(.csv) 또는 Parquet(.parquet) 파일만 지원합니다.")
             elif not os.path.isfile(path):
                 st.error(f"파일을 찾을 수 없습니다: {path}")
             else:
-                _run_eda_from_csv(path)
+                _run_eda_from_file(path)
         elif not path:
             st.info("파일 경로를 입력한 뒤 'EDA 시작' 버튼을 누르세요.")
 

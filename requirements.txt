@@ -9,6 +9,7 @@ python-dotenv>=1.0
 ydata-profiling>=4.6
 streamlit-pandas-profiling>=0.1
 pandas>=2.0
+pyarrow>=14.0
 torch>=2.0
 plotly>=5.0
 transformers>=4.40
