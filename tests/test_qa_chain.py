@@ -291,17 +291,51 @@ class TestCleanAnswer(unittest.TestCase):
         self.assertIn("\n  - 하위1", result)
         self.assertIn("\n  - 하위2", result)
 
-    def test_nested_list_renders_nested_ul(self):
-        # _clean_answer를 거친 뒤에도 _md_to_html이 중첩 <ul>을 생성해야 한다
+    def test_nested_list_indentation_preserved(self):
+        # st.markdown이 중첩 목록을 렌더하려면 _clean_answer가 하위 불릿의 들여쓰기를 보존해야 한다
         md = "## 제목\n- 상위\n  - 하위"
-        html = self.m._md_to_html(self.m._clean_answer(md))
-        self.assertGreaterEqual(html.count("<ul>"), 2)
-        self.assertIn("하위", html)
+        result = self.m._clean_answer(md)
+        self.assertIn("\n  - 하위", result)
 
     def test_collapses_midline_double_spaces(self):
         # 줄 중간/끝의 중복 공백은 여전히 1칸으로 압축되어야 한다 (회귀 방지)
         result = self.m._clean_answer("a  b   c")
         self.assertEqual(result, "a b c")
+
+    def test_empty_codeblock_removed(self):
+        # [object Object]만 든 코드블록은 빈 박스이므로 통째로 사라져야 한다
+        result = self.m._clean_answer("## 예시\n\n```python\n[object Object],\n```")
+        self.assertNotIn("```", result)
+
+    def test_unclosed_empty_codeblock_does_not_eat_following_text(self):
+        # 닫는 펜스 없이 노이즈만 든 코드블록(Solar 출력) — 펜스가 뒤 텍스트를 삼켜
+        # 빈/흐릿한 박스로 렌더되던 회귀. 펜스 수가 짝수여야(빈 박스 없음) 한다.
+        raw = "## 예시 코드\n\n```python\n[object Object],\n\n더 자세한 내용은 참고하세요."
+        result = self.m._clean_answer(raw)
+        self.assertEqual(result.count("```") % 2, 0)
+        self.assertIn("더 자세한 내용", result)
+
+    def test_real_codeblock_preserved_with_closing_fence(self):
+        # 내용 있는 코드블록은 닫는 펜스까지 보존되어야 한다 (빈박스 제거 로직의 오삭제 방지)
+        raw = "```python\nimport numpy as np\n```"
+        result = self.m._clean_answer(raw)
+        self.assertEqual(result.count("```"), 2)
+        self.assertIn("import numpy", result)
+
+    def test_object_noise_in_list_item_no_box(self):
+        # 리스트 하위 항목 자리에 [object Object]만 든 펜스(  - ```)가 빈 박스로 렌더되던 회귀.
+        # _clean_answer가 노이즈 펜스를 제거해 빈 코드블록이 남지 않아야 한다.
+        raw = "- LTR:\n  - 설명\n\n  - ```\n[object Object],\n```\n- CTR:"
+        result = self.m._clean_answer(raw)
+        self.assertNotIn("object Object", result)
+        self.assertEqual(result.count("```") % 2, 0)
+
+    def test_real_codeblock_in_list_preserved(self):
+        # 리스트 안의 '진짜 코드' 펜스는 보존되어야 한다 (리스트마커 허용이 정상 코드를 깨지 않게)
+        raw = "- 예시:\n\n  - ```python\nval = ndcg(y)\n```\n- 끝"
+        result = self.m._clean_answer(raw)
+        self.assertEqual(result.count("```") % 2, 0)
+        self.assertIn("ndcg", result)
 
 
 class TestReranker(unittest.TestCase):
@@ -363,7 +397,8 @@ class TestAnswerCache(unittest.TestCase):
         vs = MagicMock()
         vs._chunks = []
         expected = {"answer": "cached answer", "sources": []}
-        cache_key = (id(vs), "same question")
+        # 캐시 키는 (id(vs), question, backend, upstage_model). upstage 백엔드 기본은 solar-pro2.
+        cache_key = (id(vs), "same question", "upstage", "solar-pro2")
         m._answer_cache[cache_key] = expected
 
         with patch.object(m, "_build_retriever") as mock_ret:
@@ -413,87 +448,6 @@ class TestAnswerCache(unittest.TestCase):
             except Exception:
                 pass
             mock_ret.assert_called_once()
-
-
-class TestMdToHtml(unittest.TestCase):
-    def setUp(self):
-        self.m = _load_qa({})
-
-    def test_empty_string_returns_empty(self):
-        result = self.m._md_to_html("")
-        self.assertEqual(result, "")
-
-    def test_whitespace_only_returns_empty(self):
-        result = self.m._md_to_html("   \n   ")
-        self.assertEqual(result, "")
-
-    def test_headers_rendered(self):
-        md = "# 제목\n## 부제목\n### 소제목\n"
-        result = self.m._md_to_html(md)
-        self.assertIn("<h1>", result)
-        self.assertIn("제목</h1>", result)
-        self.assertIn("<h2>", result)
-        self.assertIn("부제목</h2>", result)
-        self.assertIn("<h3>", result)
-        self.assertIn("소제목</h3>", result)
-        self.assertIn('class="jupyter-markdown"', result)
-
-    def test_code_block_with_highlighting(self):
-        md = "```python\nprint('hello')\n```"
-        result = self.m._md_to_html(md)
-        self.assertIn("<pre>", result)
-        self.assertIn("<code", result)
-        self.assertIn("print", result)
-
-    def test_inline_code(self):
-        md = "이것은 `inline code` 입니다"
-        result = self.m._md_to_html(md)
-        self.assertIn("<code>", result)
-        self.assertIn("inline code", result)
-
-    def test_table_rendered(self):
-        md = "| A | B |\n|---|---|\n| 1 | 2 |"
-        result = self.m._md_to_html(md)
-        self.assertIn("<table>", result)
-        self.assertIn("<th>", result)
-        self.assertIn("<td>", result)
-
-    def test_bullet_list(self):
-        md = "- 항목1\n- 항목2\n  - 하위항목"
-        result = self.m._md_to_html(md)
-        self.assertIn("<ul>", result)
-        self.assertIn("<li>", result)
-        self.assertIn("항목1", result)
-        self.assertIn("항목2", result)
-        self.assertIn("하위항목", result)
-
-    def test_ordered_list(self):
-        md = "1. 첫째\n2. 둘째"
-        result = self.m._md_to_html(md)
-        self.assertIn("<ol>", result)
-        self.assertIn("<li>", result)
-        self.assertIn("첫째", result)
-        self.assertIn("둘째", result)
-
-    def test_blockquote(self):
-        md = "> 인용문입니다"
-        result = self.m._md_to_html(md)
-        self.assertIn("<blockquote>", result)
-        self.assertIn("인용문입니다", result)
-
-    def test_jupyter_css_included(self):
-        md = "# 테스트"
-        result = self.m._md_to_html(md)
-        self.assertIn(".jupyter-markdown", result)
-        self.assertIn("<style>", result)
-
-    def test_fallback_when_import_missing(self):
-        with patch.dict(sys.modules, {"markdown_it": None, "pygments": None}):
-            m = _load_qa({})
-            result = m._md_to_html("hello\nworld")
-            self.assertIn("hello", result)
-            self.assertIn("world", result)
-
 
 if __name__ == "__main__":
     unittest.main()

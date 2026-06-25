@@ -15,13 +15,22 @@ with st.sidebar:
     st.header("메뉴")
     tab = st.radio(
         "탭 선택",
-        ["대회 문서 Q&A", "자동 EDA 리포트"],
+        ["대회 문서 질의 응답", "자동 EDA 리포트"],
         label_visibility="collapsed",
     )
 
+# 답변 모델 선택 셀렉트박스. "Qwen (로컬)"은 GPU 추론, "solar-*"는 Upstage API로 라우팅된다.
+# 사이드바가 기본 접힘이라 각 탭 본문 상단에 둬 화면에서 바로 보이게 한다.
+# 한 번에 한 탭만 렌더되므로 같은 key를 양쪽에서 호출해도 충돌하지 않고 선택값을 공유한다.
+def _model_selectbox() -> None:
+    from src.qa_chain import MODEL_CHOICES
+    st.selectbox("답변 모델", MODEL_CHOICES, key="selected_model")
+
+
 # ── Q&A 탭 ───────────────────────────────────────────────────────────────────
-if tab == "대회 문서 Q&A":
-    st.header("대회 문서 Q&A")
+if tab == "대회 문서 질의 응답":
+    st.header("대회 문서 질의 응답")
+    _model_selectbox()
 
     uploaded_files = st.file_uploader(
         "대회 문서를 업로드하세요 (PDF, TXT)",
@@ -31,7 +40,7 @@ if tab == "대회 문서 Q&A":
 
     if uploaded_files:
         if "vectorstore" not in st.session_state or st.session_state.get("qa_files") != [f.name for f in uploaded_files]:
-            with st.status("대회 문서 Q&A 준비 중...", expanded=True) as status:
+            with st.status("대회 문서 질의 응답 준비 중...", expanded=True) as status:
                 import tempfile
 
                 from langchain_community.document_loaders import PyPDFLoader
@@ -64,18 +73,14 @@ if tab == "대회 문서 Q&A":
                 # WebSocket 타임아웃 나는 것을 방지). Upstage/OFFLINE이면 즉시 반환.
                 status.update(label="LLM 모델 준비 중...", state="running", expanded=True)
                 st.write("Qwen 같은 로컬 모델은 GPU 로딩에 시간이 걸릴 수 있습니다.")
-                warm_up_llm()
-                status.update(label="대회 문서 Q&A 준비 완료", state="complete", expanded=False)
+                warm_up_llm(st.session_state.get("selected_model"))
+                status.update(label="대회 문서 질의 응답 준비 완료", state="complete", expanded=False)
             st.success(f"{len(uploaded_files)}개 파일 인덱싱 완료")
 
     if "vectorstore" in st.session_state:
         for msg in st.session_state.get("chat_history", []):
             with st.chat_message(msg["role"]):
-                if msg["role"] == "assistant":
-                    from src.qa_chain import _md_to_html
-                    st.markdown(_md_to_html(msg["content"]), unsafe_allow_html=True)
-                else:
-                    st.markdown(msg["content"])
+                st.markdown(msg["content"])
     else:
         st.info("위 업로더에서 대회 문서(PDF 또는 TXT)를 업로드하면 Q&A를 시작할 수 있습니다.")
 
@@ -145,7 +150,7 @@ elif tab == "자동 EDA 리포트":
 # ── 채팅 입력창 (최상위 레벨 — 뷰포트 하단 고정) ──────────────────────────────
 # st.tabs() 밖에 있어야 Streamlit이 하단 sticky로 고정한다.
 # Q&A 탭이 선택되고 vectorstore가 준비된 경우에만 표시한다.
-if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
+if tab == "대회 문서 질의 응답" and "vectorstore" in st.session_state:
     if question := st.chat_input("대회 문서에 대해 질문하세요"):
         st.session_state["chat_history"].append({"role": "user", "content": question})
         with st.chat_message("user"):
@@ -167,7 +172,10 @@ if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
                         "\n".join(f"- {step}" for step in progress_steps)
                     )
 
-                result = answer_question(st.session_state["vectorstore"], question, progress=_on_step)
+                result = answer_question(
+                    st.session_state["vectorstore"], question,
+                    progress=_on_step, model=st.session_state.get("selected_model"),
+                )
                 status.update(label="답변 생성 완료", state="complete", expanded=False)
 
             # 정리 후 내용이 비면(노이즈만 있던 경우) 빈 화면 대신 안내만 출력하고 종료.
@@ -193,8 +201,7 @@ if tab == "대회 문서 Q&A" and "vectorstore" in st.session_state:
                     st.caption(" · ".join(tags))
                     st.markdown("")
 
-            from src.qa_chain import _md_to_html
-            st.markdown(_md_to_html(result["answer"]), unsafe_allow_html=True)
+            st.markdown(result["answer"])
 
             st.session_state["chat_history"].append({"role": "assistant", "content": result["answer"]})
 

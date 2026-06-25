@@ -16,7 +16,13 @@ LLM_BACKEND        = os.getenv("LLM_BACKEND", "upstage").lower()  # "upstage" | 
 # 호출부 3곳이 따로 깨지지 않게 한다. "vllm"은 greedy면 transformers와 출력이 동치이면서 2~4배 빠름.
 _LOCAL_BACKENDS    = {"llama3", "qwen", "vllm"}
 HF_TOKEN           = os.getenv("HF_TOKEN", "")
+# Upstage Solar 모델 별칭. solar-pro(1세대) | solar-pro2 | solar-pro3. 선택 안 넘어왔을 때 폴백.
+# 별칭별로 가리키는 모델이 다르다(자동 최신 아님).
+UPSTAGE_MODEL      = os.getenv("UPSTAGE_MODEL", "solar-pro2")
 LOCAL_MODEL_ID     = os.getenv("LOCAL_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
+# UI 셀렉트박스 선택지. "Qwen (로컬)"은 로컬 백엔드로, "solar-*"는 Upstage API로 라우팅된다.
+# select_model()이 이 라벨을 (backend, upstage_model)로 변환한다.
+MODEL_CHOICES      = ["Qwen (로컬)", "solar-pro2", "solar-pro3", "solar-pro"]
 # 기본 fp16: 8bit는 dequant 오버헤드로 추론이 느리다. Qwen 3B fp16≈6GB라 24GB GPU에 여유.
 # VRAM이 빠듯하면 LLAMA_LOAD_IN_8BIT=true로 8bit 복귀.
 LLAMA_LOAD_IN_8BIT    = os.getenv("LLAMA_LOAD_IN_8BIT", "false").lower() == "true"
@@ -83,12 +89,29 @@ _LOCAL_LLM_TEMPLATE = (
 
 # ── 노이즈 전처리 ─────────────────────────────────────────────────────────────
 
+def _strip_object_noise(text: str) -> str:
+    """[object Object]/undefined 노이즈를 제거한다.
+
+    이 토큰만으로 이뤄진 줄(공백·구두점·들여쓰기·리스트마커·백틱 펜스만 남는 줄)은 통째로 삭제한다.
+    코드블록·리스트·들여쓰기 등 어디에 박혀도 '의미 없는 줄'이라 형태와 무관하게 줄 단위로 잡는 게
+    가장 견고하다(형태별 정규식을 쫓다 새 형태가 계속 빠져나가던 것을 한 규칙으로 통합).
+    다른 내용과 같은 줄에 섞인 경우엔 토큰만 지우고 줄은 보존한다."""
+    # JS 객체 직렬화 산물 변종. 모델(특히 solar-pro/pro2)이 컨텍스트 노이즈를 따라 뱉는 형태들.
+    noise = r"(?:\[object Object\]|\[object [A-Za-z]+\]|\bundefined\b|\bNaN\b|\bnull\b)"
+    # 1) 노이즈 토큰 + 그 주변 구두점만으로 이뤄진 줄 → 줄 전체 삭제(줄바꿈 포함).
+    only_noise_line = rf"(?m)^[ \t]*(?:{noise}[\s,;:.\-•·`]*)+$\n?"
+    text = re.sub(only_noise_line, "", text)
+    # 2) 다른 내용과 섞인 줄에 남은 토큰은 토큰만 제거.
+    text = re.sub(rf"{noise}[,\s]*", "", text)
+    return text
+
+
 def _clean_text(text: str) -> str:
     """문서 청크의 노이즈 문자를 정규화한다."""
     text = text.replace("\\n", "\n").replace("\\t", "\t")
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"(?:\[object Object\][,\s]*)+", "", text)  # JS 객체 문자열화 산물 제거
+    text = _strip_object_noise(text)  # JS 객체 문자열화 산물 제거 (입력 차단)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"(?<=\S) {2,}", " ", text)  # 비공백 뒤의 중복 공백만 압축 (줄머리 들여쓰기 보존 → 중첩 목록 유지)
     return text.strip()
@@ -99,15 +122,62 @@ def _clean_answer(text: str) -> str:
     text = text.replace("\\n", "\n").replace("\\t", "\t")
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
-    # LLM이 컨텍스트의 JS 객체 문자열화 산물([object Object])을 따라 출력하는 경우 제거.
-    # 모든 답변이 이 함수를 거치므로 출력 경계에서 한 번에 차단(_clean_text와 동일 규칙).
-    text = re.sub(r"(?:\[object Object\][,\s]*)+", "", text)
-    # [object Object] 제거 후 내용이 비어버린 코드블록(빈 박스)을 삭제 — 화면에 빈 상자만 남는 것 방지.
-    text = re.sub(r"```[^\n]*\n\s*```", "", text)
+    # 빈 코드블록을 펜스 쌍이 온전할 때 먼저 제거한다. _has_real_content가 노이즈를 무시하므로
+    # 본문이 [object Object]뿐인 블록은 여는·닫는 펜스째 통째로 사라진다(비대칭 펜스 방지).
+    text = _strip_empty_codeblocks(text)
+    # 남은 노이즈(펜스 밖, 리스트·들여쓰기에 박힌 것)를 줄 단위로 제거. _clean_text와 동일 규칙.
+    text = _strip_object_noise(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"(?<=\S) {2,}", " ", text)  # 비공백 뒤의 중복 공백만 압축 (줄머리 들여쓰기 보존 → 중첩 목록 유지)
     text = _remove_trailing_empty_headings(text)
     return text.strip()
+
+
+def _has_real_content(body: str) -> bool:
+    """코드블록 본문에 의미 있는 내용(영숫자·한글 등 단어 문자)이 있는지.
+    공백·구두점만이거나, 노이즈([object Object]/undefined)만이면 False — 그 노이즈의 'object'를
+    실제 내용으로 오인하면 빈 블록이 안 지워진다. 노이즈를 먼저 비운 뒤 판정한다."""
+    body = _strip_object_noise(body)
+    return bool(re.search(r"[0-9A-Za-z가-힣]", body))
+
+
+def _strip_empty_codeblocks(text: str) -> str:
+    """본문이 사실상 비어버린 코드블록(빈 박스)을 제거한다.
+
+    노이즈([object Object]/undefined)를 지운 뒤 코드블록 본문이 공백·구두점만 남는 경우가 있다.
+    펜스(```)를 순서대로 짝지어, 열고 닫힌 블록의 본문이 비면 통째로 삭제한다. 닫히지 않은 채
+    끝난 펜스(Solar가 코드블록을 안 닫고 종료)는, 본문이 비면 제거하고 내용이 있으면 닫아준다.
+    정규식 한 방으로 끝줄 펜스를 지우면 정상 코드의 '닫는 펜스'까지 오삭제되므로 토큰 단위로 처리한다."""
+    # 펜스줄(```...)을 기준으로 쪼갠다. 토큰을 순회하며 펜스를 만날 때마다 in/out을 토글해
+    # '여는 펜스 → 본문 → 닫는 펜스'를 짝짓는다. 본문이 비면 그 블록(여는·닫는 펜스 포함)을 버린다.
+    # 선행 공백·리스트 마커를 허용 — 들여쓰기된 펜스(  ```)와 Solar가 만든 비표준 '리스트마커+펜스'
+    # 한 줄(  - ```)도 잡아야 빈 박스가 안 남는다. 빈 블록이면 마커째 제거(그 항목 자체가 노이즈).
+    tokens = re.split(r"(?m)^([ \t]*(?:[-*+]|\d+\.)?[ \t]*```[^\n]*)$", text)
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        is_fence = i % 2 == 1  # split의 캡처(펜스줄)는 항상 홀수 인덱스
+        if not is_fence:
+            out.append(tok)
+            i += 1
+            continue
+        # 여는 펜스. 본문(i+1)과 닫는 펜스(i+2) 존재 여부 확인.
+        body = tokens[i + 1] if i + 1 < len(tokens) else ""
+        has_close = i + 2 < len(tokens)
+        if not _has_real_content(body):
+            # 빈 블록: 여는 펜스·빈 본문·(있으면)닫는 펜스를 통째로 버린다.
+            i += 3 if has_close else 2
+        elif has_close:
+            out.append(tok); out.append(body); out.append(tokens[i + 2])
+            i += 3
+        else:
+            # 닫히지 않은 블록에 내용이 있음 → Solar가 닫는 펜스를 빠뜨린 것.
+            # 펜스를 닫아 코드블록을 완성한다(빈 박스가 뒤 텍스트를 삼키는 것 방지).
+            # ponytail: 코드/일반텍스트 구분은 휴리스틱이라 안 함 — 빈 칸만 확실히 제거.
+            out.append(tok); out.append(body.rstrip() + "\n```")
+            i += 2
+    return "".join(out)
 
 
 def _remove_trailing_empty_headings(text: str) -> str:
@@ -129,169 +199,6 @@ def _contains_disallowed_cjk(text: str) -> bool:
     text = re.sub(r"`[^`\n]+`", "", text)
     return bool(re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
 
-
-def _md_to_html(text: str) -> str:
-    """마크다운을 Jupyter Notebook 스타일 HTML로 변환한다.
-    markdown-it-py + pygments로 코드 하이라이팅, 표, 목록 등을 완전히 렌더링한다.
-    """
-    if not text or not text.strip():
-        return ""
-
-    try:
-        from markdown_it import MarkdownIt
-        from pygments import highlight
-        from pygments.lexers import get_lexer_by_name, guess_lexer
-        from pygments.formatters import HtmlFormatter
-        from pygments.util import ClassNotFound
-    except ImportError:
-        # 폴백: markdown-it-py나 pygments가 없으면 기본 텍스트를 그대로 반환
-        return text.replace("\n", "<br>")
-
-    def _highlight_code(code: str, lang: str | None, attrs: str) -> str:
-        if lang:
-            try:
-                lexer = get_lexer_by_name(lang.strip())
-            except ClassNotFound:
-                lexer = guess_lexer(code)
-        else:
-            lexer = guess_lexer(code)
-        formatter = HtmlFormatter(
-            style="default",
-            noclasses=True,
-            wrapcode=True,
-            prestyles="margin:0; padding:0;",
-        )
-        return highlight(code, lexer, formatter)
-
-    md = MarkdownIt("commonmark", {"highlight": _highlight_code})
-    md.enable("table")
-
-    html = md.render(text)
-
-    # Jupyter Notebook 스타일 CSS
-    css = """<style>
-    .jupyter-markdown {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-        line-height: 1.6;
-        color: #ffffff;
-    }
-    .jupyter-markdown h1 {
-        font-size: 2em;
-        border-bottom: 1px solid #e0e0e0;
-        padding-bottom: 0.3em;
-        margin-top: 1em;
-        margin-bottom: 0.5em;
-        color: #f0b429;
-        font-weight: 600;
-    }
-    .jupyter-markdown h2 {
-        font-size: 1.5em;
-        border-bottom: 1px solid #e0e0e0;
-        padding-bottom: 0.3em;
-        margin-top: 1em;
-        margin-bottom: 0.5em;
-        color: #f0b429;
-        font-weight: 600;
-    }
-    .jupyter-markdown h3 {
-        font-size: 1.25em;
-        margin-top: 1em;
-        margin-bottom: 0.5em;
-        color: #f0b429;
-        font-weight: 600;
-    }
-    .jupyter-markdown h4 {
-        font-size: 1em;
-        margin-top: 1em;
-        margin-bottom: 0.5em;
-        color: #f0b429;
-        font-weight: 600;
-    }
-    .jupyter-markdown pre {
-        background: #f7f7f7;
-        border: 1px solid #e0e0e0;
-        border-radius: 4px;
-        padding: 16px;
-        overflow: auto;
-        font-size: 85%;
-        line-height: 1.45;
-        margin: 1em 0;
-    }
-    .jupyter-markdown code {
-        background: rgba(27,31,35,0.05);
-        border-radius: 3px;
-        padding: 0.2em 0.4em;
-        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
-        font-size: 85%;
-    }
-    .jupyter-markdown pre code {
-        background: transparent;
-        padding: 0;
-        border-radius: 0;
-        font-size: 100%;
-    }
-    .jupyter-markdown blockquote {
-        border-left: 4px solid #dfe2e5;
-        padding-left: 16px;
-        color: #6a737d;
-        margin: 0 0 1em 0;
-    }
-    .jupyter-markdown table {
-        border-collapse: collapse;
-        width: 100%;
-        margin: 1em 0;
-        overflow: auto;
-        display: block;
-    }
-    .jupyter-markdown th, .jupyter-markdown td {
-        border: 1px solid #dfe2e5;
-        padding: 6px 13px;
-    }
-    .jupyter-markdown th {
-        background: #f6f8fa;
-        font-weight: 600;
-    }
-    .jupyter-markdown tr:nth-child(2n) {
-        background: #f6f8fa;
-    }
-    .jupyter-markdown ul, .jupyter-markdown ol {
-        padding-left: 2em;
-        margin-bottom: 1em;
-    }
-    .jupyter-markdown li > ul, .jupyter-markdown li > ol {
-        margin-bottom: 0;
-    }
-    .jupyter-markdown li {
-        color: #ffffff;
-    }
-    .jupyter-markdown ul > li {
-        list-style-type: disc;
-    }
-    .jupyter-markdown ul > li > ul > li {
-        list-style-type: circle;
-    }
-    .jupyter-markdown img {
-        max-width: 100%;
-        box-sizing: border-box;
-    }
-    .jupyter-markdown a {
-        color: #0366d6;
-        text-decoration: none;
-    }
-    .jupyter-markdown a:hover {
-        text-decoration: underline;
-    }
-    .jupyter-markdown hr {
-        border: 0;
-        border-top: 1px solid #e0e0e0;
-        margin: 1em 0;
-    }
-    .jupyter-markdown p {
-        margin-bottom: 1em;
-    }
-    </style>"""
-
-    return f'<div class="jupyter-markdown">{html}</div>{css}'
 
 
 def _enrich_chunk(doc: Document) -> Document:
@@ -353,9 +260,23 @@ def _get_embeddings():
     )
 
 
-def _get_upstage_llm():
+def _resolve_choice(choice: str | None) -> tuple[str, str]:
+    """UI 셀렉트박스 라벨을 (backend, upstage_model)로 변환한다.
+    choice가 None이면 전역 설정(LLM_BACKEND/UPSTAGE_MODEL)을 그대로 쓴다.
+    "solar-*" 라벨이면 upstage 백엔드 + 그 별칭, 그 외("Qwen (로컬)" 등)면 전역 로컬 백엔드.
+    """
+    if not choice:
+        return LLM_BACKEND, UPSTAGE_MODEL
+    if choice.startswith("solar"):
+        return "upstage", choice
+    # 로컬 선택 — 전역 LLM_BACKEND가 로컬(qwen/vllm)이면 그걸 쓰고, 아니면 qwen 기본.
+    backend = LLM_BACKEND if LLM_BACKEND in _LOCAL_BACKENDS else "qwen"
+    return backend, UPSTAGE_MODEL
+
+
+def _get_upstage_llm(model: str | None = None):
     from langchain_upstage import ChatUpstage
-    return ChatUpstage(api_key=UPSTAGE_API_KEY, model="solar-pro")
+    return ChatUpstage(api_key=UPSTAGE_API_KEY, model=model or UPSTAGE_MODEL)
 
 
 def _get_upstage_prompt():
@@ -514,31 +435,38 @@ def build_vectorstore(docs: list[Document]) -> FAISS:
     return vs
 
 
-def warm_up_llm() -> None:
+def warm_up_llm(model: str | None = None) -> None:
     """로컬 LLM(LLaMA/Qwen)을 미리 로딩해 캐시에 채운다.
 
     첫 질문이 '모델 로딩 + 추론'을 한꺼번에 떠안아 WebSocket 타임아웃이 나는 것을 막는다.
     문서 인덱싱 직후(이미 spinner가 도는 구간)에 호출하면 실제 질문은 추론만 한다.
     Upstage(API)·OFFLINE 모드는 로딩이 없으므로 아무 것도 하지 않는다.
+    model: UI 선택 라벨. 로컬 백엔드로 풀릴 때만 모델을 데운다(Solar 선택 시 무의미).
     """
     # 리랭커도 첫 질문에서 분리(질문마다 재로딩하던 것을 미리 캐시).
     _rerank_with_cross_encoder("warm up", [Document(page_content="warm up")], top_k=1)
-    if not OFFLINE_MODE and LLM_BACKEND in _LOCAL_BACKENDS:
+    backend, _ = _resolve_choice(model)
+    if not OFFLINE_MODE and backend in _LOCAL_BACKENDS:
         _get_llama_llm()  # 캐시(_llama_llm_cache)를 채운다
 
 
-def answer_question(vectorstore: FAISS, question: str, progress=None) -> dict[str, Any]:
+def answer_question(vectorstore: FAISS, question: str, progress=None,
+                    model: str | None = None) -> dict[str, Any]:
     """{'answer': str, 'sources': list[Document]} 반환.
 
     progress: 선택적 콜백 (label: str) -> None. 각 단계 시작 시 호출돼 진행 상황을
     UI에 표시한다. None이면(기본) 아무 것도 하지 않아 기존 호출부와 호환된다.
+    model: UI 셀렉트박스 라벨("Qwen (로컬)" | "solar-pro2" 등). None이면 전역 설정 사용.
     """
     def _step(label: str) -> None:
         if progress is not None:
             progress(label)
 
+    backend, upstage_model = _resolve_choice(model)
+
     # ── 캐시 확인 ────────────────────────────────────────────────────────────
-    cache_key = (id(vectorstore), question)
+    # 모델 선택까지 키에 포함 — 같은 질문이라도 모델이 다르면 별도 답변이어야 한다.
+    cache_key = (id(vectorstore), question, backend, upstage_model)
     if cache_key in _answer_cache:
         _step("캐시된 답변 사용")
         return _answer_cache[cache_key]
@@ -546,7 +474,7 @@ def answer_question(vectorstore: FAISS, question: str, progress=None) -> dict[st
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.runnables import RunnablePassthrough
 
-    is_local_backend = LLM_BACKEND in _LOCAL_BACKENDS
+    is_local_backend = backend in _LOCAL_BACKENDS
     retriever_k = LOCAL_RETRIEVER_K if is_local_backend else RETRIEVER_K
     rerank_top_k = LOCAL_RERANK_TOP_K if is_local_backend else RERANK_TOP_K
 
@@ -582,7 +510,7 @@ def answer_question(vectorstore: FAISS, question: str, progress=None) -> dict[st
         return chain.invoke(input_question)
 
     if is_local_backend:
-        _step(f"답변 생성 ({LLM_BACKEND})")
+        _step(f"답변 생성 ({backend})")
         llm = _get_llama_llm()
         prompt = _get_llama_prompt()
         raw_answer = _run_chain(llm, prompt)
@@ -602,8 +530,8 @@ def answer_question(vectorstore: FAISS, question: str, progress=None) -> dict[st
         return result
 
     try:
-        _step("답변 생성 (Solar-Pro)")
-        raw_answer = _run_chain(_get_upstage_llm(), _get_upstage_prompt())
+        _step(f"답변 생성 ({upstage_model})")
+        raw_answer = _run_chain(_get_upstage_llm(upstage_model), _get_upstage_prompt())
     except Exception as exc:
         import warnings
         warnings.warn(f"[recsys-coach] Upstage 호출 실패 ({exc!r}), Llama-3으로 폴백합니다.")

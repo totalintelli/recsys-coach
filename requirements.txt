@@ -21,8 +21,6 @@ bitsandbytes>=0.43
 rank-bm25>=0.2
 sentence-transformers>=2.6
 pytest>=8.0
-markdown-it-py>=3.0
-pygments>=2.0
 
 # cudf (RAPIDS) — pip install -r requirements.txt 로는 설치 불가, 아래 명령 별도 실행
 # 검증 환경: RTX 3090, CUDA Driver 12.2 (535.86.10). 드라이버가 12.2이므로 CUDA 12 계열로 통일해야 함.
