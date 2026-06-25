@@ -1,39 +1,47 @@
+import time
+
 import pandas as pd
 import streamlit as st
 
 
 class Checklist:
-    """분석 진행 상황을 □/✓ 체크리스트로 실시간 표시한다.
+    """분석 진행 상황을 체크리스트로 실시간 표시한다(단계별 소요 시간 포함).
 
-    start(label)로 항목을 추가하면 □ 상태로 화면에 나타나고,
-    complete()를 호출하면 직전 항목이 ✓로 바뀐다. 항목이 추가/완료될 때마다
-    placeholder 전체를 다시 렌더링하므로 화면이 자동 갱신된다.
+    start(label)로 항목을 추가하면 진행 중(⏳) 상태로 나타나고,
+    complete()를 호출하면 직전 항목이 완료(✓)로 바뀌며 소요 시간이 붙는다.
+    항목이 추가/완료될 때마다 placeholder 전체를 다시 렌더링해 화면이 자동 갱신된다.
+    호출부 시그니처(start/complete)는 그대로라 모든 사용처에 자동 적용된다.
     """
 
     def __init__(self, placeholder: st.delta_generator.DeltaGenerator) -> None:
         self._placeholder = placeholder
-        self._items: list[tuple[str, bool]] = []  # (label, done)
+        self._items: list[list] = []  # [label, done, start_ts, elapsed]
+        self._t0 = time.perf_counter()  # 전체 시작 시각(누적 경과 표시용)
 
     def start(self, label: str) -> None:
-        """새 분석 항목을 □ 상태로 추가하고 화면을 갱신한다."""
-        self._items.append((label, False))
+        """새 분석 항목을 진행 중 상태로 추가하고 화면을 갱신한다."""
+        self._items.append([label, False, time.perf_counter(), None])
         self._render()
 
     def complete(self) -> None:
-        """가장 최근에 시작한 항목을 ✓ 상태로 바꾸고 화면을 갱신한다."""
-        for i in range(len(self._items) - 1, -1, -1):
-            label, done = self._items[i]
-            if not done:
-                self._items[i] = (label, True)
+        """가장 최근에 시작한 항목을 완료로 바꾸고 소요 시간을 기록·갱신한다."""
+        for item in reversed(self._items):
+            if not item[1]:
+                item[1] = True
+                item[3] = time.perf_counter() - item[2]
                 break
         self._render()
 
     def _render(self) -> None:
         lines = []
-        for label, done in self._items:
-            mark = "✓" if done else "□"
-            lines.append(f"{mark} {label}")
-        self._placeholder.markdown("\n".join(f"- {ln}" for ln in lines))
+        for label, done, _start, elapsed in self._items:
+            if done:
+                lines.append(f"✓ {label} — `{elapsed:.1f}s`")
+            else:
+                lines.append(f"⏳ {label} …")
+        total = time.perf_counter() - self._t0
+        body = "\n".join(f"- {ln}" for ln in lines)
+        self._placeholder.markdown(f"{body}\n\n**총 경과: `{total:.1f}s`**")
 
 
 # 범주형 ID로 볼 고유값 상한 — 이보다 적으면 분포 막대그래프가 의미 있음
@@ -482,9 +490,93 @@ def _eda_cpu(df: pd.DataFrame, checklist: Checklist) -> None:
         checklist.complete()
 
 
+# 추천 대회용 요약에서 쓸 컬럼명 — 데이터 개요(event_type/purchase 기반 NDCG@10)에 맞춤.
+# 컬럼이 없으면 해당 항목만 조용히 건너뛴다(다른 데이터셋에도 안전).
+# 제출이 유저당 Top10이므로 추천 요약의 인기·카테고리·브랜드도 Top10으로 통일.
+_REC_TOP_N = 10
+
+
+def _recsys_competition_summary(df: pd.DataFrame, checklist: Checklist) -> None:
+    """NDCG@10(구매 예측) 대회를 겨냥한 요약. 단변량 통계로는 안 나오는 교차/집계만.
+
+    정답은 event_type=='purchase'. purchase 행이 없으면 섹션 전체를 건너뛴다.
+    인기 Top-N은 그대로 베이스라인 추천 후보가 되고, 콜드 유저·재구매율은
+    폴백 전략 규모를 알려준다. 집계가 가벼워 pandas로만 처리(GPU 불필요).
+    """
+    if "event_type" not in df.columns:
+        return  # 이 데이터셋엔 해당 없음
+
+    checklist.start("추천 대회 요약 (NDCG@10)")
+    st.header("🏆 추천 대회 요약 (NDCG@10 · 구매 예측)")
+
+    # 1) event_type 분포 + 구매 전환율 — 정답(purchase)이 얼마나 희소한지부터.
+    st.subheader("이벤트 타입 분포 · 구매 전환율")
+    et = df["event_type"].value_counts(dropna=False)
+    _render_centered_table(_value_counts_table(et, "event_type", top_n=10))
+    views, purchases = int(et.get("view", 0)), int(et.get("purchase", 0))
+    if views:
+        st.caption(f"구매 전환율 ≈ {purchases / views * 100:.4f}% (purchase {purchases:,} / view {views:,})")
+
+    purchases_df = df[df["event_type"] == "purchase"]
+    if purchases_df.empty:
+        st.warning("purchase 이벤트가 없어 구매 기반 요약을 건너뜁니다.")
+        checklist.complete()
+        return
+
+    # 2) 구매 인기 Top-N 아이템 = 인기 베이스라인 추천 후보(전원 동일 추천 시 NDCG 바닥선).
+    if "item_id" in purchases_df.columns:
+        st.subheader(f"구매 인기 아이템 Top {_REC_TOP_N} (인기 베이스라인)")
+        st.caption("이 Top10을 전원에게 추천한 점수가 모델이 넘어야 할 바닥선입니다.")
+        _render_centered_table(_value_counts_table(purchases_df["item_id"].value_counts(), "item_id", top_n=_REC_TOP_N))
+
+    # 3) 유저당 구매 수 분포 + 콜드(구매 0회) 유저 비율 — 폴백 대상 규모.
+    if "user_id" in df.columns:
+        st.subheader("유저당 구매 수 분포 · 콜드 유저 비율")
+        per_user = purchases_df.groupby("user_id").size()
+        total_users = df["user_id"].nunique()
+        cold = total_users - per_user.shape[0]
+        st.caption(
+            f"전체 유저 {total_users:,}명 중 구매 이력 있는 유저 {per_user.shape[0]:,}명, "
+            f"콜드 유저(구매 0회) {cold:,}명 ({cold / total_users * 100:.1f}%) → 인기 추천으로 폴백 대상."
+        )
+        _render_centered_table(_value_counts_table(per_user.value_counts(), "유저당 구매 수", top_n=10))
+
+        # 4) 재구매율 — 같은 유저가 같은 아이템을 다시 사는 비율(과거 구매 = 강한 후보인지).
+        if "item_id" in purchases_df.columns:
+            pair_counts = purchases_df.groupby(["user_id", "item_id"]).size()
+            repeat_pairs = int((pair_counts >= 2).sum())
+            total_pairs = int(pair_counts.shape[0])
+            if total_pairs:
+                st.caption(
+                    f"재구매(같은 유저·같은 아이템 2회+) 쌍 {repeat_pairs:,} / 전체 구매 쌍 {total_pairs:,} "
+                    f"({repeat_pairs / total_pairs * 100:.2f}%)."
+                )
+
+    # 5) 구매 카테고리·브랜드 Top-N — 개인화 후보를 좁히는 신호.
+    for col in ("category_code", "brand"):
+        if col in purchases_df.columns:
+            st.subheader(f"구매 {col} Top {_REC_TOP_N}")
+            _render_centered_table(_value_counts_table(purchases_df[col].value_counts(dropna=False), col, top_n=_REC_TOP_N))
+
+    # 6) 구매 시간 분포 — recency 효과/시간 분할 구조 파악.
+    if "event_time" in purchases_df.columns:
+        parsed = pd.to_datetime(purchases_df["event_time"], errors="coerce")
+        if parsed.notna().any():
+            st.subheader("구매 일별 추이")
+            daily = parsed.dropna().dt.floor("D").value_counts().sort_index()
+            import plotly.express as px
+            fig = px.line(x=daily.index, y=daily.values, labels={"x": "날짜", "y": "구매 수"})
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    checklist.complete()
+
+
 def generate_eda(df: pd.DataFrame, checklist: Checklist) -> None:
     _inject_centered_table_css()
     backend = detect_compute_backend()
+
+    _recsys_competition_summary(df, checklist)
 
     with st.sidebar:
         label = "GPU: RTX 3090" if backend == "gpu" else "CPU"
