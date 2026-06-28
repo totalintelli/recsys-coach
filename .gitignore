@@ -218,7 +218,10 @@ __marimo__/
 .streamlit/secrets.toml
 
 .env
+
+# 대회 데이터 — 절대 커밋 금지
 *.csv
+*.parquet
 
 # macOS
 .DS_Store
@@ -228,3 +231,4 @@ plans/
 
 # Claude Code config (agents/skills/settings) — 로컬 개발 도구, 제품 일부 아님
 .claude/
+data/train.parquet
