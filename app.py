@@ -43,8 +43,8 @@ if tab == "대회 문서 질의 응답":
         )
 
     uploaded_files = st.file_uploader(
-        "대회 문서를 업로드하세요 (PDF, TXT)",
-        type=["pdf", "txt"],
+        "대회 문서를 업로드하세요 (PDF, TXT, MD)",
+        type=["pdf", "txt", "md"],
         accept_multiple_files=True,
     )
 
