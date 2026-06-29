@@ -7,6 +7,8 @@ from langchain_core.documents import Document
 
 load_dotenv()
 
+_OFFLINE = os.getenv("OFFLINE_MODE", "false").lower() == "true"
+
 st.set_page_config(page_title="RecSys Coach", page_icon="🏆", layout="wide")
 st.title("🏆 RecSys Coach")
 st.caption("추천 시스템 대회 참가자를 위한 AI 코칭 도우미")
@@ -31,6 +33,14 @@ def _model_selectbox() -> None:
 if tab == "대회 문서 질의 응답":
     st.header("대회 문서 질의 응답")
     _model_selectbox()
+
+    if _OFFLINE:
+        st.info(
+            "**오프라인 모드** — Upstage API를 호출하지 않습니다. "
+            "임베딩은 로컬 모델(`paraphrase-multilingual-MiniLM-L12-v2`)을 사용하고, "
+            "답변은 LLM 생성 없이 검색 결과를 직접 반환합니다.",
+            icon="ℹ️",
+        )
 
     uploaded_files = st.file_uploader(
         "대회 문서를 업로드하세요 (PDF, TXT)",
@@ -64,16 +74,21 @@ if tab == "대회 문서 질의 응답":
                         text = raw.decode("utf-8", errors="ignore")
                         docs.append(Document(page_content=text, metadata={"source": uf.name}))
 
+                embed_note = "로컬 임베딩 모델 사용 중." if _OFFLINE else "Upstage 임베딩 API 사용 중."
                 status.update(label="문서 벡터 인덱스 생성 중...", state="running", expanded=True)
-                st.write("검색용 벡터 인덱스를 생성하는 중입니다.")
+                st.write(f"검색용 벡터 인덱스를 생성하는 중입니다. {embed_note}")
                 st.session_state["vectorstore"] = build_vectorstore(docs)
                 st.session_state["qa_files"] = [f.name for f in uploaded_files]
                 st.session_state.setdefault("chat_history", [])
                 # 로컬 LLM을 지금 미리 로딩한다(첫 질문이 모델 로딩+추론을 한꺼번에 떠안아
-                # WebSocket 타임아웃 나는 것을 방지). Upstage/OFFLINE이면 즉시 반환.
-                status.update(label="LLM 모델 준비 중...", state="running", expanded=True)
-                st.write("Qwen 같은 로컬 모델은 GPU 로딩에 시간이 걸릴 수 있습니다.")
-                warm_up_llm(st.session_state.get("selected_model"))
+                # WebSocket 타임아웃 나는 것을 방지). Upstage/OFFLINE이면 LLM 로딩은 없으나
+                # 리랭커는 공통으로 미리 캐시한다.
+                status.update(label="모델 준비 중...", state="running", expanded=True)
+                st.write("리랭커 및 LLM 모델을 미리 로딩합니다. 처음 실행 시 시간이 걸릴 수 있습니다.")
+                warm_up_llm(
+                    st.session_state.get("selected_model"),
+                    progress=lambda label: status.update(label=label, state="running", expanded=True),
+                )
                 status.update(label="대회 문서 질의 응답 준비 완료", state="complete", expanded=False)
             st.success(f"{len(uploaded_files)}개 파일 인덱싱 완료")
 

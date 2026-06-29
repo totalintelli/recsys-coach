@@ -262,6 +262,12 @@ def _rerank_with_cross_encoder(query: str, docs: list[Document], top_k: int = 3)
 # ── LLM / 프롬프트 헬퍼 ──────────────────────────────────────────────────────
 
 def _get_embeddings():
+    if OFFLINE_MODE:
+        from langchain_huggingface import HuggingFaceEmbeddings
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+            model_kwargs={"device": "cpu"},
+        )
     from langchain_upstage import UpstageEmbeddings
     return UpstageEmbeddings(
         api_key=UPSTAGE_API_KEY,
@@ -444,18 +450,25 @@ def build_vectorstore(docs: list[Document]) -> FAISS:
     return vs
 
 
-def warm_up_llm(model: str | None = None) -> None:
+def warm_up_llm(model: str | None = None, progress=None) -> None:
     """로컬 LLM(LLaMA/Qwen)을 미리 로딩해 캐시에 채운다.
 
     첫 질문이 '모델 로딩 + 추론'을 한꺼번에 떠안아 WebSocket 타임아웃이 나는 것을 막는다.
     문서 인덱싱 직후(이미 spinner가 도는 구간)에 호출하면 실제 질문은 추론만 한다.
-    Upstage(API)·OFFLINE 모드는 로딩이 없으므로 아무 것도 하지 않는다.
-    model: UI 선택 라벨. 로컬 백엔드로 풀릴 때만 모델을 데운다(Solar 선택 시 무의미).
+    Upstage(API)·OFFLINE이면 LLM 로딩이 없으나, 리랭커는 공통으로 미리 캐시한다.
+    model: UI 선택 라벨. 로컬 백엔드로 풀릴 때만 LLM을 데운다(Solar 선택 시 무의미).
+    progress: 선택적 콜백 (label: str) -> None. 단계별 진행 상황을 UI에 표시한다.
     """
+    def _step(label: str) -> None:
+        if progress is not None:
+            progress(label)
+
     # 리랭커도 첫 질문에서 분리(질문마다 재로딩하던 것을 미리 캐시).
+    _step("리랭커 모델 로딩 중 (cross-encoder)...")
     _rerank_with_cross_encoder("warm up", [Document(page_content="warm up")], top_k=1)
     backend, _ = _resolve_choice(model)
     if not OFFLINE_MODE and backend in _LOCAL_BACKENDS:
+        _step(f"LLM 모델 로딩 중 ({backend})...")
         _get_llama_llm()  # 캐시(_llama_llm_cache)를 채운다
 
 
