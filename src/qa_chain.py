@@ -138,6 +138,10 @@ def _clean_answer(text: str) -> str:
     text = _strip_object_noise(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"(?<=\S) {2,}", " ", text)  # 비공백 뒤의 중복 공백만 압축 (줄머리 들여쓰기 보존 → 중첩 목록 유지)
+    # 제목·단락 직후 목록 항목 앞 빈 줄 보장 — CommonMark/Streamlit 렌더러는 빈 줄 없이
+    # 바로 이어지는 목록을 bullet list로 파싱하지 못해 `- 항목`이 일반 텍스트로 출력됨.
+    text = re.sub(r"(?m)(?<=[^\n])\n([ \t]*[-*+] )", r"\n\n\1", text)
+    text = re.sub(r"(?m)(?<=[^\n])\n([ \t]*\d+\. )", r"\n\n\1", text)
     text = _remove_trailing_empty_headings(text)
     return text.strip()
 
