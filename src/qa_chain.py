@@ -142,6 +142,7 @@ def _clean_answer(text: str) -> str:
     # 바로 이어지는 목록을 bullet list로 파싱하지 못해 `- 항목`이 일반 텍스트로 출력됨.
     text = re.sub(r"(?m)(?<=[^\n])\n([ \t]*[-*+] )", r"\n\n\1", text)
     text = re.sub(r"(?m)(?<=[^\n])\n([ \t]*\d+\. )", r"\n\n\1", text)
+    text = _escape_literal_tildes(text)  # 범위·근사 표기 ~가 취소선으로 렌더링되는 것 방지
     text = _remove_trailing_empty_headings(text)
     return text.strip()
 
@@ -211,6 +212,21 @@ def _contains_disallowed_cjk(text: str) -> bool:
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
     text = re.sub(r"`[^`\n]+`", "", text)
     return bool(re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
+
+
+def _escape_literal_tildes(text: str) -> str:
+    """\ubc94\uc704\u00b7\uadfc\uc0ac \ud45c\uae30\uc758 \ubb3c\uacb0(~)\uc774 \ucde8\uc18c\uc120\uc73c\ub85c \ub80c\ub354\ub9c1\ub418\ub294 \uac83\uc744 \ub9c9\ub294\ub2e4.
+
+    \ud55c\uad6d\uc5b4\ub294 "5~10\ucd08", "~420MB"\ucc98\ub7fc ~\ub97c \ubc94\uc704/\uadfc\uc0ac \uae30\ud638\ub85c \uc4f0\ub294\ub370, Streamlit CommonMark\ub294
+    \ud55c \uc904\uc5d0 ~\uac00 \ub458 \uc774\uc0c1\uc774\uba74 \uadf8 \uc0ac\uc774\ub97c ~~\ucde8\uc18c\uc120~~\uc73c\ub85c \ud574\uc11d\ud55c\ub2e4. \ucf54\uce6d \ub2f5\ubcc0\uc5d0\uc11c \ucde8\uc18c\uc120\uc744 \uc758\ub3c4\ud558\ub294
+    \uacbd\uc6b0\ub294 \uc0ac\uc2e4\uc0c1 \uc5c6\uc73c\ubbc0\ub85c \ubcf8\ubb38\uc758 ~\ub97c \uc774\uc2a4\ucf00\uc774\ud504(\\~)\ud574 \ubb38\uc790 \uadf8\ub300\ub85c \ub80c\ub354\ub9c1\ud55c\ub2e4.
+    \ucf54\ub4dc \uc601\uc5ed(``` \ube14\ub85d\u00b7\uc778\ub77c\uc778 `code`)\uc740 \ub9c8\ud06c\ub2e4\uc6b4\uc774 \uc801\uc6a9\ub418\uc9c0 \uc54a\uc73c\ub2c8 \ubc31\uc2ac\ub798\uc2dc\uac00 \uadf8\ub300\ub85c \ubcf4\uc774\uc9c0
+    \uc54a\ub3c4\ub85d \uac74\ub4dc\ub9ac\uc9c0 \uc54a\ub294\ub2e4."""
+    # \ucf54\ub4dc \ud39c\uc2a4\u00b7\uc778\ub77c\uc778 \ucf54\ub4dc\ub97c \ucea1\ucc98\ub85c \ubd84\ub9ac \u2192 \uc9dd\uc218 \uc778\ub371\uc2a4(\ucf54\ub4dc \ubc16 \ubcf8\ubb38)\uc5d0\uc11c\ub9cc ~ \uc774\uc2a4\ucf00\uc774\ud504.
+    parts = re.split(r"(```.*?```|`[^`\n]+`)", text, flags=re.DOTALL)
+    for i in range(0, len(parts), 2):
+        parts[i] = parts[i].replace("~", "\\~")
+    return "".join(parts)
 
 
 
